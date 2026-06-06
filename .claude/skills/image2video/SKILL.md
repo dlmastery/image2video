@@ -45,17 +45,31 @@ mode is diagnosed (don't make the next agent rediscover it).
 
 ### In progress
 
-- **Webapp + ComfyUI run end-to-end up to model load.** `/prompt` accepts
-  the patched workflow with zero validation errors. ComfyUI begins
-  sampling on the 4090 but bails with Windows error 1455 ("paging
-  file too small") during model load.
-- **BLOCKER: Windows pagefile.** Combined commit budget needed: ~50 GB
-  (Sulphur FP8 29 GB + Sulphur LoRA 10 GB + distilled LoRA 3-4 GB +
-  Gemma encoder 7 GB + ComfyUI Python overhead). User has 32 GB RAM
-  so default pagefile of ~32 GB caps total commit ~64 GB, but other
-  resident processes eat that headroom. **Fix:** raise Windows
-  pagefile to 96-128 GB via System Properties -> Advanced -> Performance
-  Settings -> Advanced -> Virtual Memory.
+- **Webapp output collection robustness** — first 10Eros run actually
+  generated a video (`comfyui/output/Eros/I2V_00001.mp4`) but the
+  webapp's `_ws_progress_loop` returned before the VAE decode tail
+  finished, so `_collect_output` never ran and the result didn't land
+  in `image2video_jobs/<id>/output.mp4`. Need an `/history` polling
+  fallback after the WS goes silent.
+
+### Done (10Eros end-to-end!)
+
+- **First 10Eros video generated.** 768×512 H.264 + AAC, 24 fps,
+  1.04 s clip at `comfyui/output/Eros/I2V_00001.mp4` (silent) and
+  `I2V_00001-audio.mp4`. Q3_K_M GGUF UNET + Gemma 3 + canonical
+  Vantage workflow, full two-stage sampling: 13 steps base + 3 steps
+  refine. Wall time ~11 min on RTX 4090 Laptop in `--lowvram` mode.
+- **All stack pieces in place.** 10 ComfyUI custom node packs loaded
+  (KJNodes, LTXVideo, GGUF, PromptRelay, Manager, 10S-Comfy-nodes,
+  rgthree, comfy_mtb, Custom-Scripts, VideoHelperSuite, Comfyroll,
+  RES4LYF). Nvidia_RTX_Nodes_ComfyUI fails to import (needs nvvfx
+  SDK) - the workflow's RTXVideoSuperResolution is automatically
+  bypassed by the converter.
+- **All 10Eros assets downloaded** via `tools/download_10eros.py`:
+  10Eros_v1-Q3_K_M.gguf (11 GB), gemma_3_12B_it.safetensors (22.7 GB),
+  ltx-2-3-22b-text_encoder.safetensors (2.3 GB), ltx-2-3-22b-VAE.safetensors
+  (1.4 GB), audio_vae (0.36 GB), OmniNFT LoRA (1.2 GB), upscaler
+  x2-1.1 (1.0 GB).
 
 ### Next (in order)
 
