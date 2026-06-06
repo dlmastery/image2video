@@ -52,6 +52,10 @@ $ComfyMgrRepo   = "https://github.com/ltdrdata/ComfyUI-Manager.git"
 $LTXVideoRepo   = "https://github.com/Lightricks/ComfyUI-LTXVideo.git"
 $GGUFNodeRepo   = "https://github.com/city96/ComfyUI-GGUF.git"
 $PromptRelayRepo= "https://github.com/kijai/ComfyUI-PromptRelay.git"
+# KJNodes is required for several utility nodes (PathchSageAttentionKJ
+# etc.) referenced by Sulphur's distilled workflow. Without it ComfyUI
+# 400s on submit with missing_node_type.
+$KJNodesRepo    = "https://github.com/kijai/ComfyUI-KJNodes.git"
 
 # Sulphur-2-base ships several checkpoints; we pull the FP8 variant
 # (~29 GB) which is the sweet spot for 24 GB VRAM. See model card.
@@ -148,6 +152,7 @@ Clone-Or-Update $ComfyMgrRepo    (Join-Path $CustomDir "ComfyUI-Manager")
 Clone-Or-Update $LTXVideoRepo    (Join-Path $CustomDir "ComfyUI-LTXVideo")
 Clone-Or-Update $GGUFNodeRepo    (Join-Path $CustomDir "ComfyUI-GGUF")
 Clone-Or-Update $PromptRelayRepo (Join-Path $CustomDir "ComfyUI-PromptRelay")
+Clone-Or-Update $KJNodesRepo     (Join-Path $CustomDir "ComfyUI-KJNodes")
 
 # ----------------------------------------------------------------------
 # 3. Install Python deps into the conda env
@@ -187,6 +192,13 @@ Run-Pip @("install","truststore","pip-system-certs")
 Run-Pip @("install","--upgrade","--force-reinstall",
          "--index-url","https://download.pytorch.org/whl/cu121",
          "torch","torchvision","torchaudio")
+
+# 3f. Pin kornia to 0.7.x. ComfyUI-LTXVideo imports
+# 'pad' from kornia.geometry.transform.pyramid which was removed in
+# kornia 0.8.x. Without this pin, LTXVideo silently fails to load
+# during ComfyUI startup and every video-generation submit returns
+# missing_node_type for ResizeImageResolution / LTXVScheduler / etc.
+Run-Pip @("install","kornia==0.7.4")
 
 # ----------------------------------------------------------------------
 # 4. Download Sulphur-2 checkpoint + Qwen prompt enhancer
@@ -272,6 +284,21 @@ if (Test-Path $WfSrc) {
     Write-Host "Copying Sulphur workflows -> ./workflows/"
     Copy-Item -Recurse -Force "$WfSrc\*" $WfDst
 }
+
+# 4b. Stage-2 + stage-3 asset downloads. Sulphur's workflow references
+# files that aren't in the main checkpoint repo - the LTX spatial
+# upscaler (Lightricks/LTX-2.3), the Gemma-3 text encoder
+# (inflatebot/...), Sulphur LoRAs (distill_loras/ subdir), plus a
+# placeholder PNG for T2V LoadImage. Without these, ComfyUI 400s on
+# /prompt with value_not_in_list for every loader. ~22 GB.
+Write-Host ""
+Write-Host "Stage 2: spatial upscaler + T2V placeholder image"
+Run-Conda @("run","-n",$EnvName,"--no-capture-output","python",
+            (Join-Path $RepoRoot "tools\download_stage2_assets.py"))
+Write-Host ""
+Write-Host "Stage 3: Gemma encoder + audio VAE + LoRAs (~22 GB; longest step)"
+Run-Conda @("run","-n",$EnvName,"--no-capture-output","python",
+            (Join-Path $RepoRoot "tools\download_stage3_assets.py"))
 
 # ----------------------------------------------------------------------
 # 5. cuDNN DLL discovery patch (Windows-only)
