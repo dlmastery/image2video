@@ -31,6 +31,18 @@ $RepoRoot = $PSScriptRoot
 if (-not $RepoRoot) { $RepoRoot = (Get-Location).Path }
 
 # ----------------------------------------------------------------------
+# Corporate-cert SSL bypass for conda / pip / huggingface_hub.
+# This box has a corporate-issued root cert that Python's bundled CA
+# store doesn't trust; without this conda + pip fail with SSL_CERT
+# verify errors on every package fetch. We trust the local box.
+# ----------------------------------------------------------------------
+$env:CONDA_SSL_VERIFY = "false"
+$env:PIP_TRUSTED_HOST = "pypi.org files.pythonhosted.org pypi.python.org download.pytorch.org"
+$env:HF_HUB_DISABLE_TELEMETRY = "1"
+$env:CURL_CA_BUNDLE = ""
+$env:REQUESTS_CA_BUNDLE = ""
+
+# ----------------------------------------------------------------------
 # Versions / sources - pin so this script keeps working as upstreams move.
 # ----------------------------------------------------------------------
 $EnvName        = "img2vid"
@@ -65,10 +77,28 @@ function Assert-Exe($name, $hint) {
 }
 
 function Run-Conda([string[]]$argList) {
-    # conda emits warnings on stderr that PS5 wraps as ErrorRecords -
-    # capture both into stdout to avoid the cmdlet-error tarpit.
-    & conda @argList 2>&1 | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) { throw "conda $($argList -join ' ') failed (exit $LASTEXITCODE)" }
+    # DO NOT use `2>&1` here. PS5 wraps stderr from native exes as
+    # ErrorRecords (NativeCommandError), and combined with
+    # $ErrorActionPreference=Stop that aborts on the FIRST stderr line
+    # even when conda's actual exit code is 0. Let stderr flow to its
+    # own stream; the outer Tee-Object on the caller side still
+    # captures both streams.
+    & conda @argList
+    if ($LASTEXITCODE -ne 0) {
+        throw "conda $($argList -join ' ') failed (exit $LASTEXITCODE)"
+    }
+}
+
+function Run-Pip([string[]]$pipArgs) {
+    # Pip via conda run -n <env>, with trusted-host flags so corporate
+    # cert chains don't tank wheel downloads.
+    $extra = @(
+        "--trusted-host","pypi.org",
+        "--trusted-host","files.pythonhosted.org",
+        "--trusted-host","pypi.python.org",
+        "--trusted-host","download.pytorch.org"
+    )
+    Run-Conda (@("run","-n",$EnvName,"--no-capture-output","pip") + $pipArgs + $extra)
 }
 
 function Clone-Or-Update($url, $dir) {
@@ -126,23 +156,20 @@ Write-Step "3/7  Installing Python deps into '$EnvName'"
 
 # 3a. ComfyUI's own requirements (torch + cu121 + xformers + etc.)
 $ComfyReq = Join-Path $ComfyDir "requirements.txt"
-Run-Conda @("run","-n",$EnvName,"--no-capture-output",
-            "pip","install","-r",$ComfyReq)
+Run-Pip @("install","-r",$ComfyReq)
 
 # 3b. Each custom node's requirements.txt (Manager, LTXVideo, etc.)
 foreach ($nodeDir in (Get-ChildItem $CustomDir -Directory)) {
     $req = Join-Path $nodeDir.FullName "requirements.txt"
     if (Test-Path $req) {
         Write-Host "Installing deps for $($nodeDir.Name)"
-        Run-Conda @("run","-n",$EnvName,"--no-capture-output",
-                    "pip","install","-r",$req)
+        Run-Pip @("install","-r",$req)
     }
 }
 
 # 3c. Our own webapp deps
 $WebReq = Join-Path $RepoRoot "requirements.txt"
-Run-Conda @("run","-n",$EnvName,"--no-capture-output",
-            "pip","install","-r",$WebReq)
+Run-Pip @("install","-r",$WebReq)
 
 # ----------------------------------------------------------------------
 # 4. Download Sulphur-2 checkpoint + Qwen prompt enhancer
@@ -158,7 +185,20 @@ New-Item -ItemType Directory -Force -Path $ModelsCache | Out-Null
 # Use huggingface_hub.snapshot_download via python so we get resume,
 # parallel chunks, and proper auth handling.
 $DownloadPy = @"
-import os, sys
+import os, sys, ssl
+
+# Disable SSL verification for corporate-cert boxes (same reason as the
+# CONDA_SSL_VERIFY / PIP_TRUSTED_HOST bypass at the top of setup.ps1).
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+ssl._create_default_https_context = ssl._create_unverified_context
+
 from huggingface_hub import hf_hub_download, snapshot_download
 
 repo_root  = r'$RepoRoot'.replace('\\\\','/')
