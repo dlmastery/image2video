@@ -23,11 +23,15 @@ mode is diagnosed (don't make the next agent rediscover it).
 - **Scaffold** — repo at `C:\Users\evija\image2video`, files:
   `webapp.py` (1076 lines), `setup.ps1`, `CLAUDE.md`, `README.md`,
   `requirements.txt`, `.gitignore`, `workflows/`, `docs/`.
-- **Git initialised**, local-only on `master`. Commits so far:
-  `181308b` initial scaffold, `1143a5e` em-dash strip,
-  `84447e7` SSL bypass + 2>&1 drop, `03d0dbc` truststore for HF,
-  + CUDA torch reinstall commit. NOT pushed to GitHub yet — user
-  decision needed on public/private.
+- **GitHub repo created**: `dlmastery/image2video` (PRIVATE; flip with
+  `gh repo edit dlmastery/image2video --visibility public` if you want
+  it public later). Branch `main` tracks origin. Initial 7 commits
+  pushed (scaffold → em-dash strip → SSL bypass + 2>&1 drop →
+  truststore → CUDA torch → workflows + skill).
+  **Sync policy: push at every meaningful checkpoint** (patcher
+  passes, converter works, smoke test green, etc.). Use
+  `$env:GIT_SSL_NO_VERIFY='1'; git push` since this box has the same
+  corporate-cert issue we worked around in setup.ps1.
 - **Install (setup.ps1) succeeds end-to-end.**
   - Conda env `img2vid` (Python 3.11) created
   - ComfyUI + ComfyUI-Manager + ComfyUI-LTXVideo + ComfyUI-GGUF +
@@ -41,34 +45,49 @@ mode is diagnosed (don't make the next agent rediscover it).
 
 ### In progress
 
-- **Workflow patcher upgrade** — the v1 `webapp.py` patcher walks from
-  a generic sampler's `positive`/`negative` inputs, but the real LTX
-  graph uses `SamplerCustomAdvanced` whose prompts live on a
-  `CFGGuider` upstream and whose seed lives on a separate `RandomNoise`
-  node. Need to rewire `_patch_workflow` to follow:
-  `SamplerCustomAdvanced.inputs.guider` → `CFGGuider` →
-  `positive`/`negative` → `CLIPTextEncode`, and
-  `SamplerCustomAdvanced.inputs.noise` → `RandomNoise` (set
-  `noise_seed`).
-- **UI→API converter** — only 1 of 4 shipped workflows is API-format
-  (`ltx23_i2v distilled.json`). The other three are UI-editor format
-  (`{"nodes":[...], "links":[...]}`) which `/prompt` rejects. Need a
-  ~50-line converter so all 4 variants are usable.
+- **Boot the webapp end-to-end.** Patcher unit-tested green against
+  the real Sulphur workflow (positive vs negative correctly routed,
+  T2V bypass flag works, I2V copies source image to comfyui/input).
+  Now need: start Flask + ComfyUI subprocess, verify all four phases
+  run a real job.
 
 ### Next (in order)
 
-1. **Patcher + converter** (above).
-2. **Re-wire `_load_workflows()`** to keep all four variants in
-   `WORKFLOWS` keyed by `{mode}_{quality}`, e.g. `t2v_base`,
-   `t2v_distilled`. UI form picks quality.
-3. **Start `webapp.py`** — verify the Flask listens, ComfyUI child
-   boots, all four workflows load cleanly.
-4. **Smoke-test each mode** with cheap params: T2V (low res, 25
-   frames), then I2V with an uploaded image, then Extend on the T2V
-   result.
-5. **Fix whatever breaks** (likely candidates noted in [Gotchas](#gotchas)).
-6. **Commit + push** — user must confirm whether `dlmastery/image2video`
-   should be public or private.
+1. **Start `webapp.py`** — confirm Flask binds `:8080`, ComfyUI child
+   binds `:8188`, workflow loader prints
+   `using 'ltx23_i2v distilled.json' for both T2V and I2V`.
+2. **Smoke-test T2V** with cheap params (256x256, 25 frames, 4 steps,
+   enhance OFF). Confirm: enhancing skipped, submitting, generating
+   ticks the step bar, encoding, done. Output MP4 plays in VLC.
+3. **Smoke-test I2V** with an uploaded image. Confirm
+   `comfyui/input/<jobid>_<filename>` exists, bypass=False, output
+   animates the input image.
+4. **Smoke-test Extend** on a T2V result. Confirm `start_frame.png`
+   in the new job dir, concat MP4 plays continuously.
+5. **UI→API converter** for the 3 UI-format workflows (optional —
+   only worth doing if v1 quality is insufficient and we want the
+   non-distilled base workflow).
+6. **Fix whatever breaks**.
+
+### Done (workflow patcher)
+
+- `_patch_workflow` rewritten for the real LTX-2.3 graph (see commit
+  history). Key behaviours:
+  - Walks every `CFGGuider`, follows `positive`/`negative` slot
+    semantics through combiner nodes (`LTXVCropGuides`,
+    `LTXVConditioning`) to the terminal `CLIPTextEncode`.
+  - **Slot-aware resolver**: slot 0 -> "positive" input, slot 1 ->
+    "negative". Without this, both sides routed to the same encoder
+    and overwrote each other.
+  - Patches `noise_seed` on every `RandomNoise`, `steps` on every
+    `LTXVScheduler`, dims/length on `EmptyLTXVLatentVideo`.
+  - For T2V: sets `LTXVImgToVideoInplace.bypass = True` on every
+    such node, so the same workflow works for both modes.
+  - For I2V: copies the upload into `comfyui/input/`, sets bypass
+    False, patches `LoadImage.image` to the new filename.
+- `_load_workflows` now picks the single API-format workflow
+  (`ltx23_i2v distilled.json`) and registers it as BOTH `t2v` and
+  `i2v` in WORKFLOWS (same dict, deep-copied per job).
 
 ---
 

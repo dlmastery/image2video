@@ -162,21 +162,34 @@ def _set(job: Job, **kw):
 # ===========================================================================
 # Workflow loading + patching — by class_type, never by node ID
 # ===========================================================================
+# Node-class taxonomy for the LTX-2.3 / Sulphur-2 graphs we patch.
+# The actual API-format workflow shipped by Sulphur uses a two-stage
+# SamplerCustomAdvanced pipeline; prompts and seeds don't live on the
+# sampler directly. See SKILL.md gotcha #6 for the graph shape.
 SAMPLER_CLASSES = (
-    "LTXVideoSampler", "LTXVSampler",
+    "SamplerCustomAdvanced", "SamplerCustom",
     "KSamplerAdvanced", "KSampler",
-    "SamplerCustom", "SamplerCustomAdvanced",
 )
+GUIDER_CLASSES   = ("CFGGuider", "BasicGuider", "DualCFGGuider")
+NOISE_CLASSES    = ("RandomNoise",)
+SCHEDULER_CLASSES = ("LTXVScheduler", "BasicScheduler", "KarrasScheduler")
 LOAD_IMAGE_CLASSES = ("LoadImage", "LoadImageMask")
-TEXT_ENCODE_CLASSES = ("CLIPTextEncode", "BNK_CLIPTextEncodeAdvanced")
+TEXT_ENCODE_CLASSES = (
+    "CLIPTextEncode", "BNK_CLIPTextEncodeAdvanced",
+    "LTXAVTextEncoderEncode",
+)
+STRING_PRIMITIVE_CLASSES = (
+    "PrimitiveStringMultiline", "PrimitiveString", "String",
+    "CLIPTextEncode",  # patched directly; not really a primitive
+)
 VIDEO_OUT_CLASSES = (
-    "VHS_VideoCombine", "SaveAnimatedWEBP",
-    "SaveVideo", "SaveAnimatedPNG",
+    "SaveVideo", "CreateVideo",
+    "VHS_VideoCombine", "SaveAnimatedWEBP", "SaveAnimatedPNG",
 )
 LATENT_CLASSES = (
-    "EmptyLatentVideo", "EmptyLTXVLatent",
-    "LTXVideoCondConditioning", "LTXVImgToVideo",
+    "EmptyLTXVLatentVideo", "EmptyLatentVideo",
 )
+I2V_INJECT_CLASSES = ("LTXVImgToVideoInplace", "LTXVImgToVideo")
 
 def _nodes_by_class(wf: dict, classes: tuple) -> list[str]:
     return [nid for nid, n in wf.items() if n.get("class_type") in classes]
@@ -208,108 +221,204 @@ def _trace_back(wf: dict, start: str, target_classes: tuple, max_hops: int = 8) 
             break
     return None
 
-def _classify_workflow(wf: dict) -> str:
-    """Return 't2v' if no LoadImage feeds the sampler, else 'i2v'."""
-    samplers = _nodes_by_class(wf, SAMPLER_CLASSES)
-    if not samplers:
-        # Some LTX templates wrap sampling differently; check for an image
-        # loader anywhere as a fallback.
-        return "i2v" if _nodes_by_class(wf, LOAD_IMAGE_CLASSES) else "t2v"
-    sampler = samplers[0]
-    img_node = _trace_back(wf, sampler, LOAD_IMAGE_CLASSES)
-    return "i2v" if img_node else "t2v"
+# Workflows keyed by mode ("t2v" / "i2v"). We use the SAME underlying
+# Sulphur JSON for both modes — the LTXVImgToVideoInplace nodes have a
+# bypass flag the patcher toggles. See _patch_workflow.
+WORKFLOWS: dict[str, dict] = {}
 
-WORKFLOWS: dict[str, dict] = {}  # populated by _load_workflows()
+def _is_api_format(wf: dict) -> bool:
+    """API format: top-level keys are node ids -> {class_type, inputs}.
+    UI editor format wraps in {"nodes":[...], "links":[...]} - reject."""
+    if not isinstance(wf, dict):
+        return False
+    if "nodes" in wf or "links" in wf:
+        return False
+    # Heuristic: at least one value has class_type
+    return any(isinstance(v, dict) and "class_type" in v for v in wf.values())
 
 def _load_workflows() -> None:
-    """Scan ./workflows/ for the Sulphur JSONs and pick one per mode."""
+    """Scan ./workflows/ for the Sulphur LTX-2.3 API-format JSONs.
+
+    Sulphur ships 4 files but only `ltx23_i2v distilled.json` is
+    submittable (the other 3 are UI editor format). We use that single
+    API workflow for BOTH T2V and I2V; the patcher flips
+    LTXVImgToVideoInplace.bypass based on whether the job has a source
+    image.
+    """
     WORKFLOWS.clear()
     if not WORKFLOWS_DIR.exists():
-        print(f"[webapp] WARNING: {WORKFLOWS_DIR} missing — run setup.ps1 first")
+        print(f"[webapp] WARNING: {WORKFLOWS_DIR} missing - run setup.ps1 first")
         return
     candidates = sorted(WORKFLOWS_DIR.rglob("*.json"))
+    api_workflows = []
     for p in candidates:
         try:
             wf = json.loads(p.read_text(encoding="utf-8"))
         except Exception as e:
             print(f"[webapp] skipping {p.name}: {e}")
             continue
-        # API export workflows have node-id keys at top level. The UI
-        # export format wraps in {"nodes":[...]} — skip those.
-        if not isinstance(wf, dict) or "nodes" in wf:
+        if not _is_api_format(wf):
+            print(f"[webapp] skipping {p.name} (UI editor format)")
             continue
-        mode = _classify_workflow(wf)
-        if mode not in WORKFLOWS:           # first match wins
-            WORKFLOWS[mode] = wf
-            print(f"[webapp] workflow[{mode}] = {p.name}")
-    if "i2v" not in WORKFLOWS:
-        print("[webapp] WARNING: no I2V workflow found — Extend will fail")
-    if "t2v" not in WORKFLOWS:
-        print("[webapp] WARNING: no T2V workflow found")
+        api_workflows.append((p, wf))
+        print(f"[webapp] loaded API workflow: {p.name} ({len(wf)} nodes)")
+    if not api_workflows:
+        print("[webapp] WARNING: no API-format workflow found in workflows/")
+        return
+    # Prefer one with 'i2v' in the filename (it has the
+    # LTXVImgToVideoInplace nodes we need for both modes).
+    api_workflows.sort(key=lambda pw: (0 if "i2v" in pw[0].name.lower() else 1,
+                                       pw[0].name))
+    base = api_workflows[0][1]
+    WORKFLOWS["t2v"] = base
+    WORKFLOWS["i2v"] = base   # same dict; patcher deep-copies before mutating
+    print(f"[webapp] using {api_workflows[0][0].name} for both T2V and I2V "
+          f"(LTXVImgToVideoInplace.bypass toggled per job)")
+
+def _resolve_text_target(wf: dict, start_ref: list, max_hops: int = 8) -> Optional[str]:
+    """Walk back from a [node_id, slot] reference through combiner nodes
+    (LTXVCropGuides / LTXVConditioning) until we hit a CLIPTextEncode or
+    string primitive.
+
+    Slot semantics: combiner nodes preserve slot identity - output 0 is
+    the "positive" output, output 1 is the "negative" output. So when
+    following back, slot 0 takes the upstream's `positive` input and
+    slot 1 takes its `negative` input. Without this, positive and
+    negative end up resolving to the same CLIPTextEncode (the one on
+    the positive chain) and overwriting each other.
+    """
+    if not isinstance(start_ref, list) or len(start_ref) < 1:
+        return None
+    cur_id, cur_slot = str(start_ref[0]), (int(start_ref[1]) if len(start_ref) > 1 else 0)
+    seen = set()
+    for _ in range(max_hops):
+        key = (cur_id, cur_slot)
+        if key in seen: break
+        seen.add(key)
+        node = wf.get(cur_id)
+        if not node: break
+        ct = node.get("class_type", "")
+        if ct in TEXT_ENCODE_CLASSES:
+            return cur_id
+        if ct in ("PrimitiveStringMultiline", "PrimitiveString", "String"):
+            return cur_id
+        inputs = node.get("inputs", {})
+        # Slot 0 -> "positive", slot 1 -> "negative" (combiner convention)
+        slot_name = "positive" if cur_slot == 0 else ("negative" if cur_slot == 1 else None)
+        nxt_ref = inputs.get(slot_name) if slot_name else None
+        # If the combiner doesn't have that named input, fall back to the
+        # first connection-shaped input (handles non-combiner pass-throughs)
+        if not isinstance(nxt_ref, list):
+            nxt_ref = next((v for v in inputs.values()
+                            if isinstance(v, list) and len(v) >= 1), None)
+        if not isinstance(nxt_ref, list):
+            break
+        cur_id = str(nxt_ref[0])
+        cur_slot = int(nxt_ref[1]) if len(nxt_ref) > 1 else 0
+    return None
+
+def _set_text(wf: dict, node_id: str, text: str) -> None:
+    """Patch the right key on a CLIPTextEncode / string primitive."""
+    node = wf.get(node_id)
+    if not node: return
+    inp = node.setdefault("inputs", {})
+    for key in ("text", "value", "string"):
+        if key in inp or node.get("class_type") in TEXT_ENCODE_CLASSES:
+            inp[key] = text
+            return
+    inp["text"] = text  # last-resort
 
 def _patch_workflow(wf: dict, job: Job) -> dict:
-    """Deep-copy + patch the workflow with this job's parameters.
+    """Deep-copy + patch the LTX-2.3 / Sulphur-2 workflow for this job.
 
-    Resolves prompts / image / dims by walking the graph from the sampler
-    backwards, so we don't depend on integer node IDs.
+    LTX uses a custom-sampler graph (SamplerCustomAdvanced + CFGGuider +
+    RandomNoise + LTXVScheduler) rather than a classic KSampler. Prompts
+    live on CFGGuider.positive/negative which themselves point at
+    CLIPTextEncode (possibly through a PrimitiveStringMultiline). Seed
+    lives on RandomNoise. Steps on LTXVScheduler. Workflows often have
+    TWO of each (two-stage low-res-then-refine sampling), so we patch
+    every match, not just the first.
+
+    The same workflow handles T2V + I2V: flip
+    LTXVImgToVideoInplace.bypass = True for T2V (no source image), else
+    False and patch LoadImage.image.
     """
     wf = json.loads(json.dumps(wf))  # deep copy
-    samplers = _nodes_by_class(wf, SAMPLER_CLASSES)
-    if not samplers:
-        raise RuntimeError("workflow has no recognized sampler node")
-    sampler = samplers[0]
 
-    # Steps + seed on the sampler itself
-    sinp = wf[sampler].setdefault("inputs", {})
-    if "steps" in sinp:
-        sinp["steps"] = int(job.steps)
-    if "seed" in sinp:
-        sinp["seed"] = int(job.seed) if job.seed else int(uuid.uuid4().int & 0xFFFFFFFF)
-    elif "noise_seed" in sinp:
-        sinp["noise_seed"] = int(job.seed) if job.seed else int(uuid.uuid4().int & 0xFFFFFFFF)
+    pos_text = job.enhanced_prompt or job.prompt or ""
+    neg_text = job.negative_prompt or ""
 
-    # Positive prompt
-    pos = _upstream(wf, sampler, "positive")
-    if pos and wf[pos].get("class_type") in TEXT_ENCODE_CLASSES:
-        wf[pos]["inputs"]["text"] = job.enhanced_prompt or job.prompt
+    # 1. Prompts via every CFGGuider in the graph.
+    guiders = _nodes_by_class(wf, GUIDER_CLASSES)
+    if guiders:
+        for gid in guiders:
+            gi = wf[gid].setdefault("inputs", {})
+            for role, text in (("positive", pos_text), ("negative", neg_text)):
+                ref = gi.get(role)
+                if not isinstance(ref, list) or len(ref) < 1 or not text:
+                    continue
+                # Pass full ref (incl. slot) so the resolver can route
+                # positive/negative correctly through combiner nodes.
+                target = _resolve_text_target(wf, ref)
+                if target:
+                    _set_text(wf, target, text)
     else:
-        # Some workflows route the prompt through a conditioning chain;
-        # find the first CLIPTextEncode reachable from the sampler's
-        # positive input.
-        cand = _trace_back(wf, sampler, TEXT_ENCODE_CLASSES) if pos else None
-        if cand:
-            wf[cand]["inputs"]["text"] = job.enhanced_prompt or job.prompt
+        # Fallback: no guiders found — patch every CLIPTextEncode with
+        # the positive prompt (best-effort; loses negative).
+        for nid in _nodes_by_class(wf, TEXT_ENCODE_CLASSES):
+            _set_text(wf, nid, pos_text)
 
-    # Negative prompt
-    neg = _upstream(wf, sampler, "negative")
-    if neg and wf[neg].get("class_type") in TEXT_ENCODE_CLASSES and job.negative_prompt:
-        wf[neg]["inputs"]["text"] = job.negative_prompt
+    # 2. Seed on every RandomNoise.
+    seed = int(job.seed) if job.seed else int(uuid.uuid4().int & 0xFFFFFFFF)
+    for nid in _nodes_by_class(wf, NOISE_CLASSES):
+        wf[nid].setdefault("inputs", {})["noise_seed"] = seed
 
-    # I2V image
-    if job.source_image:
-        img_node = _trace_back(wf, sampler, LOAD_IMAGE_CLASSES)
-        if img_node is None:
-            # Some I2V workflows take the image directly into a conditioning
-            # node — search all LoadImage nodes.
-            cand = _nodes_by_class(wf, LOAD_IMAGE_CLASSES)
-            img_node = cand[0] if cand else None
-        if img_node:
-            # ComfyUI expects the image file to live under
-            # comfyui/input/ — copy it there with a unique name.
-            inp_dir = COMFY_DIR / "input"
-            inp_dir.mkdir(parents=True, exist_ok=True)
-            src = Path(job.source_image)
-            dst_name = f"{job.id}_{src.name}"
-            shutil.copy2(src, inp_dir / dst_name)
-            wf[img_node]["inputs"]["image"] = dst_name
+    # 3. Steps on LTXVScheduler / generic schedulers, plus any classic
+    # samplers that take steps directly.
+    for nid in _nodes_by_class(wf, SCHEDULER_CLASSES):
+        si = wf[nid].setdefault("inputs", {})
+        if "steps" in si:
+            si["steps"] = int(job.steps)
+    for nid in _nodes_by_class(wf, ("KSampler", "KSamplerAdvanced")):
+        si = wf[nid].setdefault("inputs", {})
+        if "steps" in si:
+            si["steps"] = int(job.steps)
 
-    # Width / height / frame count — search latent / conditioning nodes
-    for lid in _nodes_by_class(wf, LATENT_CLASSES):
-        li = wf[lid].setdefault("inputs", {})
+    # 4. Width / height / frame count on every latent.
+    for nid in _nodes_by_class(wf, LATENT_CLASSES):
+        li = wf[nid].setdefault("inputs", {})
         if "width" in li:  li["width"]  = int(job.width)
         if "height" in li: li["height"] = int(job.height)
         for k in ("length", "num_frames", "frame_count", "video_length"):
-            if k in li: li[k] = int(job.frames)
+            if k in li:
+                li[k] = int(job.frames)
+
+    # 5. I2V image injection. Sulphur's workflow has
+    # LTXVImgToVideoInplace nodes with a `bypass` flag — flip it to True
+    # for T2V (no image), False for I2V (patch LoadImage.image).
+    i2v_nodes = _nodes_by_class(wf, I2V_INJECT_CLASSES)
+    load_image_nodes = _nodes_by_class(wf, LOAD_IMAGE_CLASSES)
+
+    if job.source_image:
+        # Copy upload into comfyui/input/ with a job-prefixed name
+        inp_dir = COMFY_DIR / "input"
+        inp_dir.mkdir(parents=True, exist_ok=True)
+        src = Path(job.source_image)
+        dst_name = f"{job.id}_{src.name}"
+        try:
+            shutil.copy2(src, inp_dir / dst_name)
+        except Exception as e:
+            print(f"[patch] copying source image failed: {e}")
+        for nid in load_image_nodes:
+            wf[nid].setdefault("inputs", {})["image"] = dst_name
+        for nid in i2v_nodes:
+            wf[nid].setdefault("inputs", {})["bypass"] = False
+    else:
+        # T2V: bypass the image-injection nodes so they pass the latent
+        # through unchanged. LoadImage stays untouched (its filename
+        # default like 'Sulfur_Dust.webp' just isn't used when bypassed).
+        for nid in i2v_nodes:
+            wf[nid].setdefault("inputs", {})["bypass"] = True
 
     return wf
 
