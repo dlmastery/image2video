@@ -178,6 +178,16 @@ Run-Pip @("install","-r",$WebReq)
 # which already trusts the corporate root.
 Run-Pip @("install","truststore","pip-system-certs")
 
+# 3e. Force CUDA torch wheels.
+# ComfyUI's requirements.txt + custom node requirements pull plain
+# 'torch' from PyPI's default index, which on Windows is the CPU-only
+# wheel. Running the model on that fails with "Torch not compiled
+# with CUDA enabled" at startup. Reinstall from PyTorch's cu121 index
+# AFTER all other pip steps so nothing downgrades us back to CPU.
+Run-Pip @("install","--upgrade","--force-reinstall",
+         "--index-url","https://download.pytorch.org/whl/cu121",
+         "torch","torchvision","torchaudio")
+
 # ----------------------------------------------------------------------
 # 4. Download Sulphur-2 checkpoint + Qwen prompt enhancer
 # ----------------------------------------------------------------------
