@@ -102,7 +102,11 @@ if MODEL_FAMILY == "10eros":
     VAE_NAME        = "ltx-2-3-22b-VAE.safetensors"
     AUDIO_VAE_NAME  = "ltx-2-3-22b-audio_vae.safetensors"
     CKPT_NAME       = "ltx-2-3-22b-text_encoder.safetensors"   # for the LTX loaders that scan checkpoints/
-    TEXT_ENCODER    = "gemma_3_12B_it.safetensors"
+    # FP4 mixed is the smallest Comfy-Org Gemma quant (9.45 GB vs 22.7 GB
+    # for FP16). With --lowvram already shuttling models per-op, the
+    # smaller encoder is much friendlier on 16 GB VRAM and reduces the
+    # quality penalty from --lowvram precision juggling.
+    TEXT_ENCODER    = "gemma_3_12B_it_fp4_mixed.safetensors"
     UPSCALER_NAME   = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 else:
     GGUF_NAME       = f"sulphur_dev-{SULPHUR_GGUF_QUANT}.gguf"
@@ -124,6 +128,14 @@ SULPHUR_CKPT_NAME = CKPT_NAME
 LOADER_REMAPS = {
     "CheckpointLoaderSimple":  {"ckpt_name": SULPHUR_CKPT_NAME},
     "CheckpointLoader":        {"ckpt_name": SULPHUR_CKPT_NAME},
+    # The Vantage 10Eros workflow uses DualCLIPLoader with the language
+    # encoder (Gemma) as clip_name1 and the LTX-2.3 text encoder as
+    # clip_name2. Without this remap, the workflow's hardcoded filenames
+    # stay (gemma_3_12B_it.safetensors) - which becomes invalid once we
+    # switch to the FP4 quant. Always force our shipped filenames.
+    "DualCLIPLoader":          {"clip_name1": SULPHUR_TEXT_ENCODER_NAME,
+                                "clip_name2": "ltx-2-3-22b-text_encoder.safetensors"},
+    "CLIPLoader":              {"clip_name": SULPHUR_TEXT_ENCODER_NAME},
     # LTXVAudioVAELoader + LTXAVTextEncoderLoader both scan
     # models/checkpoints/. Originally they'd pull their layers from the
     # unified 29 GB FP8 ckpt, but mmap-slicing that giant file under
@@ -237,7 +249,15 @@ SAMPLER_CLASSES = (
     "SamplerCustomAdvanced", "SamplerCustom",
     "KSamplerAdvanced", "KSampler",
 )
-GUIDER_CLASSES   = ("CFGGuider", "BasicGuider", "DualCFGGuider")
+GUIDER_CLASSES   = (
+    "CFGGuider", "BasicGuider", "DualCFGGuider",
+    # 10Eros / Vantage workflow uses Skipped-Token Guider (STGGuiderAdvanced)
+    # which has the same positive/negative input shape but a different
+    # class name. WITHOUT this, the patcher walks zero guiders and the
+    # user's prompt never gets written into CLIPTextEncode - the model
+    # samples with empty conditioning, which looks like pure noise.
+    "STGGuiderAdvanced", "STGGuider",
+)
 NOISE_CLASSES    = ("RandomNoise",)
 SCHEDULER_CLASSES = ("LTXVScheduler", "BasicScheduler", "KarrasScheduler")
 LOAD_IMAGE_CLASSES = ("LoadImage", "LoadImageMask")
