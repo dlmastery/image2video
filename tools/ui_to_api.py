@@ -151,6 +151,14 @@ def convert(ui_workflow: dict, object_info: dict) -> dict:
     nodes = ui_workflow.get("nodes") or []
     links = ui_workflow.get("links") or []
 
+    # Set of node IDs the user has muted/bypassed in the UI. Any
+    # connection input pointing at one of these gets dropped (we never
+    # emit the node, so dangling refs would otherwise cause
+    # NodeNotFoundError at execution time).
+    skipped_node_ids: set[str] = {
+        str(n.get("id")) for n in nodes if n.get("mode") in (2, 4)
+    }
+
     # Build link_id -> (src_node_id, src_slot)
     link_src: dict[int, tuple[str, int]] = {}
     for raw in links:
@@ -201,7 +209,12 @@ def convert(ui_workflow: dict, object_info: dict) -> dict:
         widget_vals = n.get("widgets_values") or []
         inputs: dict[str, Any] = _map_widgets(info, widget_vals)
 
-        # 2. Connected inputs (from `n.inputs[].link`)
+        # 2. Connected inputs (from `n.inputs[].link`). Drop any whose
+        # source is a muted/bypassed node - those nodes were never
+        # emitted, so a reference to them would NodeNotFoundError at
+        # execution. Switch-like consumers (Any Switch rgthree) handle
+        # the missing-input case fine; nodes that strictly require an
+        # input will surface a clearer validation error.
         for slot in (n.get("inputs") or []):
             name = slot.get("name")
             link = slot.get("link")
@@ -209,6 +222,8 @@ def convert(ui_workflow: dict, object_info: dict) -> dict:
                 continue
             src = link_src.get(int(link))
             if src is None:
+                continue
+            if src[0] in skipped_node_ids:
                 continue
             inputs[name] = [src[0], src[1]]
 
