@@ -31,7 +31,7 @@ $RepoRoot = $PSScriptRoot
 if (-not $RepoRoot) { $RepoRoot = (Get-Location).Path }
 
 # ----------------------------------------------------------------------
-# Versions / sources — pin so this script keeps working as upstreams move.
+# Versions / sources - pin so this script keeps working as upstreams move.
 # ----------------------------------------------------------------------
 $EnvName        = "img2vid"
 $PyVersion      = "3.11"
@@ -65,7 +65,7 @@ function Assert-Exe($name, $hint) {
 }
 
 function Run-Conda([string[]]$argList) {
-    # conda emits warnings on stderr that PS5 wraps as ErrorRecords —
+    # conda emits warnings on stderr that PS5 wraps as ErrorRecords -
     # capture both into stdout to avoid the cmdlet-error tarpit.
     & conda @argList 2>&1 | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) { throw "conda $($argList -join ' ') failed (exit $LASTEXITCODE)" }
@@ -208,7 +208,7 @@ if (Test-Path $WfSrc) {
 # ----------------------------------------------------------------------
 # 5. cuDNN DLL discovery patch (Windows-only)
 # ----------------------------------------------------------------------
-# Python 3.8+ on Windows ignores PATH for native imports — onnxruntime /
+# Python 3.8+ on Windows ignores PATH for native imports - onnxruntime /
 # torch wheels that depend on nvidia-cudnn-cu12 etc. need an explicit
 # os.add_dll_directory() call. Patch ComfyUI's entry point so the env
 # is correct before torch is imported.
@@ -235,7 +235,7 @@ if sys.platform == 'win32':
     _trt = os.path.join(_sp, 'tensorrt_libs')
     if os.path.isdir(_trt):
         _cookies.append(os.add_dll_directory(_trt))
-    # Keep cookies alive — module-level list is enough.
+    # Keep cookies alive - module-level list is enough.
     globals()['_img2vid_dll_cookies'] = _cookies
 "@
     Set-Content -Path $MainPy -Value ($patch + "`n" + $MainTxt) -Encoding utf8
@@ -243,7 +243,7 @@ if sys.platform == 'win32':
 }
 
 # ----------------------------------------------------------------------
-# 6. Smoke test — start ComfyUI in the background, hit /system_stats
+# 6. Smoke test - start ComfyUI in the background, hit /system_stats
 # ----------------------------------------------------------------------
 Write-Step "6/7  Smoke test: launching ComfyUI headless on 127.0.0.1:8188"
 
@@ -270,7 +270,7 @@ for ($i=0; $i -lt 60; $i++) {
 try { Stop-Process -Id $proc.Id -Force } catch { }
 
 if ($ok) {
-    Write-Host "ComfyUI bound 8188 OK — install is healthy." -ForegroundColor Green
+    Write-Host "ComfyUI bound 8188 OK - install is healthy." -ForegroundColor Green
 } else {
     Write-Warning "ComfyUI did not bind 8188 within 120 s. See $LogPath / $LogPath.err"
     Write-Warning "Common causes: model still loading (huge checkpoint), port in use, missing CUDA."
