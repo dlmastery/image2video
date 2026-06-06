@@ -75,15 +75,8 @@ WEB_PORT      = int(os.getenv("IMG2VID_PORT", "8080"))
 
 CLIENT_ID     = str(uuid.uuid4())  # identifies our WS connection to ComfyUI
 
-# Sulphur's workflow JSON hardcodes loader filenames that don't match
-# what we actually ship. The patcher rewrites each loader's filename
-# inputs using these tables.
-SULPHUR_CKPT_NAME = os.getenv(
-    "IMG2VID_CKPT", "sulphur_dev_fp8mixed.safetensors")
-SULPHUR_TEXT_ENCODER_NAME = (
-    "gemma-3-12b-it-orthogonal-reflection-bounded-ablation-v4-12B-fp4_mixed.safetensors")
-SULPHUR_AUDIO_VAE_NAME = "sulphur_audio_vae.safetensors"
-SULPHUR_UPSCALER_NAME = "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+# NOTE: per-family file names are configured below in the MODEL_FAMILY
+# block. The SULPHUR_* legacy names are kept as aliases for the patcher.
 
 # GGUF-mode toggle. When IMG2VID_USE_GGUF=1, the patcher rewrites the
 # unified CheckpointLoaderSimple into UnetLoaderGGUF + VAELoader so the
@@ -91,9 +84,42 @@ SULPHUR_UPSCALER_NAME = "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
 # safetensors. Cuts Windows commit budget by 14-19 GB depending on the
 # quant level, lifting the pagefile blocker.
 USE_GGUF = os.getenv("IMG2VID_USE_GGUF", "1") == "1"
+
+# Model family selector. "sulphur" uses Sulphur-2-base files; "10eros"
+# uses LTX2.3-10Eros files (different fine-tune with better face
+# consistency via TenStrip's forward-hook nodes).
+MODEL_FAMILY = os.getenv("IMG2VID_MODEL_FAMILY", "10eros").lower()
+
+# Per-family file name table. The patcher reads from this when rewriting
+# loader inputs - the LTXVideo / KJ / 10S loaders all hardcode whatever
+# filenames the original workflow author had; we overwrite them with
+# what we actually ship.
 SULPHUR_GGUF_QUANT = os.getenv("IMG2VID_GGUF_QUANT", "Q4_K_M")
-SULPHUR_GGUF_NAME = f"sulphur_dev-{SULPHUR_GGUF_QUANT}.gguf"
-SULPHUR_VAE_NAME = "sulphur_vae.safetensors"
+_EROS_GGUF_QUANT = os.getenv("IMG2VID_GGUF_QUANT", "Q3_K_M")
+
+if MODEL_FAMILY == "10eros":
+    GGUF_NAME       = f"10Eros_v1-{_EROS_GGUF_QUANT}.gguf"
+    VAE_NAME        = "ltx-2-3-22b-VAE.safetensors"
+    AUDIO_VAE_NAME  = "ltx-2-3-22b-audio_vae.safetensors"
+    CKPT_NAME       = "ltx-2-3-22b-text_encoder.safetensors"   # for the LTX loaders that scan checkpoints/
+    TEXT_ENCODER    = "gemma_3_12B_it.safetensors"
+    UPSCALER_NAME   = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+else:
+    GGUF_NAME       = f"sulphur_dev-{SULPHUR_GGUF_QUANT}.gguf"
+    VAE_NAME        = "sulphur_vae.safetensors"
+    AUDIO_VAE_NAME  = "sulphur_audio_vae.safetensors"
+    CKPT_NAME       = "sulphur_text_encoder.safetensors"
+    TEXT_ENCODER    = (
+        "gemma-3-12b-it-orthogonal-reflection-bounded-ablation-v4-12B-fp4_mixed.safetensors")
+    UPSCALER_NAME   = "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+
+# Back-compat aliases used elsewhere in the file.
+SULPHUR_GGUF_NAME = GGUF_NAME
+SULPHUR_VAE_NAME = VAE_NAME
+SULPHUR_AUDIO_VAE_NAME = AUDIO_VAE_NAME
+SULPHUR_TEXT_ENCODER_NAME = TEXT_ENCODER
+SULPHUR_UPSCALER_NAME = UPSCALER_NAME
+SULPHUR_CKPT_NAME = CKPT_NAME
 
 LOADER_REMAPS = {
     "CheckpointLoaderSimple":  {"ckpt_name": SULPHUR_CKPT_NAME},
@@ -369,44 +395,85 @@ def _is_api_format(wf: dict) -> bool:
     # Heuristic: at least one value has class_type
     return any(isinstance(v, dict) and "class_type" in v for v in wf.values())
 
-def _load_workflows() -> None:
-    """Scan ./workflows/ for the Sulphur LTX-2.3 API-format JSONs.
+def _convert_ui_workflow(ui_wf: dict) -> Optional[dict]:
+    """Use tools/ui_to_api.py to convert a UI-editor workflow into API
+    format. Requires ComfyUI to be reachable (we read /object_info)."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "ui_to_api", str(HERE / "tools" / "ui_to_api.py"))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        info = m.fetch_object_info(COMFY_URL)
+        return m.convert(ui_wf, info)
+    except Exception as e:
+        print(f"[webapp] UI->API conversion failed: {e}")
+        return None
 
-    Sulphur ships 4 files but only `ltx23_i2v distilled.json` is
-    submittable (the other 3 are UI editor format). We use that single
-    API workflow for BOTH T2V and I2V; the patcher flips
-    LTXVImgToVideoInplace.bypass based on whether the job has a source
-    image.
+def _load_workflows() -> None:
+    """Scan ./workflows/ for usable workflows.
+
+    Workflow selection depends on MODEL_FAMILY:
+      - 10eros -> prefer Vantage-10Eros_I2V_v3.2.json (UI format,
+        we convert it at boot via ComfyUI's /object_info schema)
+      - sulphur -> use ltx23_i2v distilled.json (API format)
+
+    For both families we register the chosen workflow as BOTH t2v and
+    i2v - the patcher flips LTXVImgToVideoInplace.bypass based on
+    whether the job has a source image.
     """
     WORKFLOWS.clear()
     if not WORKFLOWS_DIR.exists():
         print(f"[webapp] WARNING: {WORKFLOWS_DIR} missing - run setup.ps1 first")
         return
     candidates = sorted(WORKFLOWS_DIR.rglob("*.json"))
-    api_workflows = []
-    for p in candidates:
+
+    # Preferred filename per model family. First match wins.
+    if MODEL_FAMILY == "10eros":
+        preferred = ["vantage-10eros_i2v_v3.2", "10eros_i2v"]
+    else:
+        preferred = ["ltx23_i2v distilled"]
+
+    def _prio(p: Path) -> int:
+        n = p.name.lower()
+        for i, sub in enumerate(preferred):
+            if sub in n:
+                return i
+        return 99
+
+    sorted_paths = sorted(candidates, key=_prio)
+    chosen: Optional[tuple[Path, dict]] = None
+    for p in sorted_paths:
         try:
             wf = json.loads(p.read_text(encoding="utf-8"))
         except Exception as e:
             print(f"[webapp] skipping {p.name}: {e}")
             continue
-        if not _is_api_format(wf):
-            print(f"[webapp] skipping {p.name} (UI editor format)")
-            continue
-        api_workflows.append((p, wf))
-        print(f"[webapp] loaded API workflow: {p.name} ({len(wf)} nodes)")
-    if not api_workflows:
-        print("[webapp] WARNING: no API-format workflow found in workflows/")
+        # API-format: use directly. UI-format: convert via ComfyUI schema.
+        if _is_api_format(wf):
+            print(f"[webapp] loaded API workflow: {p.name} ({len(wf)} nodes)")
+            chosen = (p, wf)
+            break
+        else:
+            # UI-format. Convert if it's a preferred file; skip otherwise.
+            if _prio(p) >= 99:
+                print(f"[webapp] skipping {p.name} (UI editor format)")
+                continue
+            print(f"[webapp] converting {p.name} (UI format) ...")
+            api = _convert_ui_workflow(wf)
+            if api:
+                print(f"[webapp] converted to {len(api)} nodes from {p.name}")
+                chosen = (p, api)
+                break
+            else:
+                print(f"[webapp] conversion failed for {p.name}")
+
+    if chosen is None:
+        print(f"[webapp] WARNING: no usable workflow for family={MODEL_FAMILY}")
         return
-    # Prefer one with 'i2v' in the filename (it has the
-    # LTXVImgToVideoInplace nodes we need for both modes).
-    api_workflows.sort(key=lambda pw: (0 if "i2v" in pw[0].name.lower() else 1,
-                                       pw[0].name))
-    base = api_workflows[0][1]
-    WORKFLOWS["t2v"] = base
-    WORKFLOWS["i2v"] = base   # same dict; patcher deep-copies before mutating
-    print(f"[webapp] using {api_workflows[0][0].name} for both T2V and I2V "
-          f"(LTXVImgToVideoInplace.bypass toggled per job)")
+    WORKFLOWS["t2v"] = chosen[1]
+    WORKFLOWS["i2v"] = chosen[1]
+    print(f"[webapp] family={MODEL_FAMILY} using {chosen[0].name} for both T2V and I2V")
 
 def _resolve_text_target(wf: dict, start_ref: list, max_hops: int = 8) -> Optional[str]:
     """Walk back from a [node_id, slot] reference through combiner nodes
@@ -602,9 +669,15 @@ class ComfyClient:
             if sys.platform == "win32":
                 # CREATE_NEW_PROCESS_GROUP so taskkill /T can find the tree
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+            # --force-fp16 keeps sampling activations at FP16, which is
+            # important alongside GGUF Q3/Q4 weights on 16 GB-VRAM cards:
+            # the weights are tiny but activations otherwise default to
+            # FP32 and would OOM during attention. See the LTX-10Eros
+            # Vantage tutorial recipe.
             self.proc = subprocess.Popen(
                 [sys.executable, str(COMFY_DIR / "main.py"),
-                 "--listen", COMFY_HOST, "--port", str(COMFY_PORT)],
+                 "--listen", COMFY_HOST, "--port", str(COMFY_PORT),
+                 "--force-fp16"],
                 cwd=str(COMFY_DIR),
                 stdout=open(log_path, "wb"),
                 stderr=open(err_path, "wb"),
@@ -1337,14 +1410,19 @@ def main():
     if sys.platform != "win32":
         signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(0)))
 
-    _load_workflows()
-
-    # Spawn ComfyUI in a background thread so Flask binds quickly.
-    def _boot_comfy():
-        try: COMFY.start()
+    # Spawn ComfyUI in a background thread, then load workflows once it's
+    # ready (the UI->API converter needs /object_info from ComfyUI).
+    def _boot_then_load():
+        try:
+            COMFY.start()
         except Exception as e:
             print(f"[webapp] ComfyUI failed to start: {e}")
-    threading.Thread(target=_boot_comfy, daemon=True).start()
+            return
+        try:
+            _load_workflows()
+        except Exception as e:
+            print(f"[webapp] workflow loading failed: {e}")
+    threading.Thread(target=_boot_then_load, daemon=True).start()
 
     # Worker thread
     threading.Thread(target=_worker_loop, daemon=True).start()
