@@ -102,12 +102,13 @@ if MODEL_FAMILY == "10eros":
     VAE_NAME        = "ltx-2-3-22b-VAE.safetensors"
     AUDIO_VAE_NAME  = "ltx-2-3-22b-audio_vae.safetensors"
     CKPT_NAME       = "ltx-2-3-22b-text_encoder.safetensors"   # for the LTX loaders that scan checkpoints/
-    # CANONICAL FP16 per Vantage tutorial. The FP4 mixed quant we
-    # tried earlier seemed incompatible with DualCLIPLoader type='ltxv'
-    # and produced pure noise output. Stick to the file Vantage names.
-    # With --lowvram ComfyUI shuttles the 22.7 GB encoder per-op so
-    # it fits the 16 GB VRAM card.
-    TEXT_ENCODER    = "gemma_3_12B_it.safetensors"
+    # Default: gemma_3_12B_it_fp4_mixed.safetensors (9.45 GB Comfy-Org
+    # quant). The real noise cause was the Power Lora Loader silently
+    # dropping the OmniNFT LoRA, not the quant. Test FP4 first; if
+    # output quality is still off, swap to gemma_3_12B_it.safetensors
+    # (22.7 GB FP16) which is what Vantage names canonically.
+    TEXT_ENCODER    = os.getenv(
+        "IMG2VID_GEMMA_FILE", "gemma_3_12B_it_fp4_mixed.safetensors")
     UPSCALER_NAME   = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 else:
     GGUF_NAME       = f"sulphur_dev-{SULPHUR_GGUF_QUANT}.gguf"
