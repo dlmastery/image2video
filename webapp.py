@@ -102,11 +102,12 @@ if MODEL_FAMILY == "10eros":
     VAE_NAME        = "ltx-2-3-22b-VAE.safetensors"
     AUDIO_VAE_NAME  = "ltx-2-3-22b-audio_vae.safetensors"
     CKPT_NAME       = "ltx-2-3-22b-text_encoder.safetensors"   # for the LTX loaders that scan checkpoints/
-    # FP4 mixed is the smallest Comfy-Org Gemma quant (9.45 GB vs 22.7 GB
-    # for FP16). With --lowvram already shuttling models per-op, the
-    # smaller encoder is much friendlier on 16 GB VRAM and reduces the
-    # quality penalty from --lowvram precision juggling.
-    TEXT_ENCODER    = "gemma_3_12B_it_fp4_mixed.safetensors"
+    # CANONICAL FP16 per Vantage tutorial. The FP4 mixed quant we
+    # tried earlier seemed incompatible with DualCLIPLoader type='ltxv'
+    # and produced pure noise output. Stick to the file Vantage names.
+    # With --lowvram ComfyUI shuttles the 22.7 GB encoder per-op so
+    # it fits the 16 GB VRAM card.
+    TEXT_ENCODER    = "gemma_3_12B_it.safetensors"
     UPSCALER_NAME   = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 else:
     GGUF_NAME       = f"sulphur_dev-{SULPHUR_GGUF_QUANT}.gguf"

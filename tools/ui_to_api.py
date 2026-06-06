@@ -209,6 +209,33 @@ def convert(ui_workflow: dict, object_info: dict) -> dict:
         widget_vals = n.get("widgets_values") or []
         inputs: dict[str, Any] = _map_widgets(info, widget_vals)
 
+        # Special case: rgthree Power Lora Loader. Its widgets_values is
+        # a list whose entries are dicts of shape
+        #   {"on": bool, "lora": "<path>", "strength": float,
+        #    "strengthTwo": float|null}
+        # plus some header / placeholder entries we ignore. The API
+        # form takes these as lora_1, lora_2, ... slots. Without this
+        # the entire LoRA stack (including OmniNFT) gets silently
+        # dropped during conversion - which the workflow needs.
+        if ctype == "Power Lora Loader (rgthree)" and isinstance(widget_vals, list):
+            slot = 0
+            for wv in widget_vals:
+                if isinstance(wv, dict) and "lora" in wv and "strength" in wv:
+                    lora_path = wv.get("lora") or ""
+                    # Strip ltx23\ or other subdir prefixes - we keep
+                    # all LoRAs flat in models/loras/.
+                    if "\\" in lora_path:
+                        lora_path = lora_path.rsplit("\\", 1)[-1]
+                    if "/" in lora_path:
+                        lora_path = lora_path.rsplit("/", 1)[-1]
+                    slot += 1
+                    inputs[f"lora_{slot}"] = {
+                        "on": bool(wv.get("on", True)),
+                        "lora": lora_path,
+                        "strength": float(wv.get("strength", 1.0)),
+                        "strengthTwo": wv.get("strengthTwo"),
+                    }
+
         # 2. Connected inputs (from `n.inputs[].link`). Drop any whose
         # source is a muted/bypassed node - those nodes were never
         # emitted, so a reference to them would NodeNotFoundError at
