@@ -45,11 +45,17 @@ mode is diagnosed (don't make the next agent rediscover it).
 
 ### In progress
 
-- **Boot the webapp end-to-end.** Patcher unit-tested green against
-  the real Sulphur workflow (positive vs negative correctly routed,
-  T2V bypass flag works, I2V copies source image to comfyui/input).
-  Now need: start Flask + ComfyUI subprocess, verify all four phases
-  run a real job.
+- **Webapp + ComfyUI run end-to-end up to model load.** `/prompt` accepts
+  the patched workflow with zero validation errors. ComfyUI begins
+  sampling on the 4090 but bails with Windows error 1455 ("paging
+  file too small") during model load.
+- **BLOCKER: Windows pagefile.** Combined commit budget needed: ~50 GB
+  (Sulphur FP8 29 GB + Sulphur LoRA 10 GB + distilled LoRA 3-4 GB +
+  Gemma encoder 7 GB + ComfyUI Python overhead). User has 32 GB RAM
+  so default pagefile of ~32 GB caps total commit ~64 GB, but other
+  resident processes eat that headroom. **Fix:** raise Windows
+  pagefile to 96-128 GB via System Properties -> Advanced -> Performance
+  Settings -> Advanced -> Virtual Memory.
 
 ### Next (in order)
 
@@ -88,6 +94,46 @@ mode is diagnosed (don't make the next agent rediscover it).
 - `_load_workflows` now picks the single API-format workflow
   (`ltx23_i2v distilled.json`) and registers it as BOTH `t2v` and
   `i2v` in WORKFLOWS (same dict, deep-copied per job).
+- **Node-compat layer** (`_apply_compat`): renames
+  `ImageScaleDownBy` -> `ImageScaleBy` (rename `images`->`image`, add
+  `upscale_method`) and `ResizeImageResolution` ->
+  `ImageScaleToMaxDimension` (rename `resolution` -> `largest_size`).
+  Sulphur authored against an older node set; stock ComfyUI provides
+  equivalents that we map at patch time.
+- **Loader filename remaps**: workflow hardcodes filenames Sulphur
+  never shipped. `LOADER_REMAPS` table rewrites every
+  `CheckpointLoaderSimple.ckpt_name`, `LTXVAudioVAELoader.ckpt_name`
+  (which actually scans `models/checkpoints/`, not `models/vae/` -
+  the audio VAE is baked into the unified Sulphur checkpoint),
+  `LTXAVTextEncoderLoader.ckpt_name`+`text_encoder`, and
+  `LatentUpscaleModelLoader.model_name`. `LORA_NAME_MAP` rewrites
+  `sulphur_final.safetensors` -> `sulphur_lora_rank_768.safetensors`
+  (the actual filename Sulphur shipped under).
+- **T2V placeholder image** (`comfyui/input/img2vid_placeholder.png`,
+  1x1 black PNG written by `out/stage2_assets.py`): the patcher
+  points `LoadImage.image` at this so ComfyUI's pre-execution
+  file-existence check passes for T2V jobs, even though
+  `LTXVImgToVideoInplace.bypass=True` means the image is never used.
+
+### Done (model assets)
+
+`out/stage2_assets.py` + `out/stage3_assets.py` (run once at the bottom
+of `setup.ps1` in a future pass) download:
+- `ltx-2.3-spatial-upscaler-x2-1.0.safetensors` from `Lightricks/LTX-2.3`
+  into `comfyui/models/upscale_models/`
+- `gemma-3-12b-it-orthogonal-reflection-bounded-ablation-v4-12B-fp4_mixed.safetensors`
+  from `inflatebot/LTX23-gemma-3-12b-it-orthogonal-reflection-bounded-ablation-v4-fp4_mixed`
+  into `comfyui/models/text_encoders/`
+- `sulphur_audio_vae.safetensors` from
+  `vantagewithai/Sulphur-2-Base-Split` into `comfyui/models/vae/`
+  (turned out unused - audio VAE is in the main ckpt - but harmless)
+- `distill_loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors`
+  + `sulphur_lora_rank_768.safetensors` from `SulphurAI/Sulphur-2-base`
+  into `comfyui/models/loras/`
+- `comfyui/input/img2vid_placeholder.png` (1x1 black PNG)
+
+These ARE NOT yet wired into `setup.ps1`. Either rerun `out/stage2_assets.py`
++ `out/stage3_assets.py` manually after `setup.ps1`, or fold them in.
 
 ---
 

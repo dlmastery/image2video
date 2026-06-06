@@ -75,6 +75,32 @@ WEB_PORT      = int(os.getenv("IMG2VID_PORT", "8080"))
 
 CLIENT_ID     = str(uuid.uuid4())  # identifies our WS connection to ComfyUI
 
+# Sulphur's workflow JSON hardcodes loader filenames that don't match
+# what we actually ship. The patcher rewrites each loader's filename
+# inputs using these tables.
+SULPHUR_CKPT_NAME = os.getenv(
+    "IMG2VID_CKPT", "sulphur_dev_fp8mixed.safetensors")
+SULPHUR_TEXT_ENCODER_NAME = (
+    "gemma-3-12b-it-orthogonal-reflection-bounded-ablation-v4-12B-fp4_mixed.safetensors")
+SULPHUR_AUDIO_VAE_NAME = "sulphur_audio_vae.safetensors"
+SULPHUR_UPSCALER_NAME = "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+
+LOADER_REMAPS = {
+    "CheckpointLoaderSimple":  {"ckpt_name": SULPHUR_CKPT_NAME},
+    "CheckpointLoader":        {"ckpt_name": SULPHUR_CKPT_NAME},
+    # LTXVAudioVAELoader actually scans models/checkpoints/ (it pulls
+    # the audio-VAE layers OUT of the unified Sulphur checkpoint),
+    # not a separate audio_vae/ dir despite the loader name.
+    "LTXVAudioVAELoader":      {"ckpt_name": SULPHUR_CKPT_NAME},
+    "LTXAVTextEncoderLoader":  {"ckpt_name": SULPHUR_CKPT_NAME,
+                                "text_encoder": SULPHUR_TEXT_ENCODER_NAME},
+    "LatentUpscaleModelLoader": {"model_name": SULPHUR_UPSCALER_NAME},
+}
+# LoRA filename in the workflow -> file we actually have on disk
+LORA_NAME_MAP = {
+    "sulphur_final.safetensors": "sulphur_lora_rank_768.safetensors",
+}
+
 JOBS_DIR.mkdir(exist_ok=True)
 OUT_DIR.mkdir(exist_ok=True)
 
@@ -221,8 +247,50 @@ def _trace_back(wf: dict, start: str, target_classes: tuple, max_hops: int = 8) 
             break
     return None
 
+# Compat: a couple of node class_types in the shipped Sulphur workflow
+# don't exist in any ComfyUI bundle we install (Sulphur was authored
+# against a slightly different node set). Map them to equivalents from
+# the stock ComfyUI core; preserve semantics by renaming inputs and
+# injecting any required new ones.
+#   ImageScaleDownBy(scale_by, images) -> ImageScaleBy(scale_by, image, upscale_method)
+#   ResizeImageResolution(resolution, method, image)
+#       -> ImageScaleToMaxDimension(largest_size, upscale_method, image)
+NODE_COMPAT: dict[str, dict] = {
+    "ImageScaleDownBy": {
+        "to": "ImageScaleBy",
+        "rename": {"images": "image"},
+        "drop":   [],
+        "inject": {"upscale_method": "nearest-exact"},
+    },
+    "ResizeImageResolution": {
+        "to": "ImageScaleToMaxDimension",
+        "rename": {"resolution": "largest_size"},
+        "drop":   ["method"],
+        "inject": {"upscale_method": "nearest-exact"},
+    },
+}
+
+def _apply_compat(wf: dict) -> dict:
+    """Mutate the workflow in place: rewrite class_types listed in
+    NODE_COMPAT to their stock-Comfy equivalents."""
+    for nid, node in wf.items():
+        ct = node.get("class_type")
+        if ct not in NODE_COMPAT:
+            continue
+        spec = NODE_COMPAT[ct]
+        node["class_type"] = spec["to"]
+        ins = node.setdefault("inputs", {})
+        for old, new in spec["rename"].items():
+            if old in ins:
+                ins[new] = ins.pop(old)
+        for k in spec["drop"]:
+            ins.pop(k, None)
+        for k, v in spec["inject"].items():
+            ins.setdefault(k, v)
+    return wf
+
 # Workflows keyed by mode ("t2v" / "i2v"). We use the SAME underlying
-# Sulphur JSON for both modes — the LTXVImgToVideoInplace nodes have a
+# Sulphur JSON for both modes - the LTXVImgToVideoInplace nodes have a
 # bypass flag the patcher toggles. See _patch_workflow.
 WORKFLOWS: dict[str, dict] = {}
 
@@ -344,6 +412,7 @@ def _patch_workflow(wf: dict, job: Job) -> dict:
     False and patch LoadImage.image.
     """
     wf = json.loads(json.dumps(wf))  # deep copy
+    _apply_compat(wf)                # rewrite class_types we don't have
 
     pos_text = job.enhanced_prompt or job.prompt or ""
     neg_text = job.negative_prompt or ""
@@ -394,7 +463,7 @@ def _patch_workflow(wf: dict, job: Job) -> dict:
                 li[k] = int(job.frames)
 
     # 5. I2V image injection. Sulphur's workflow has
-    # LTXVImgToVideoInplace nodes with a `bypass` flag — flip it to True
+    # LTXVImgToVideoInplace nodes with a `bypass` flag - flip it to True
     # for T2V (no image), False for I2V (patch LoadImage.image).
     i2v_nodes = _nodes_by_class(wf, I2V_INJECT_CLASSES)
     load_image_nodes = _nodes_by_class(wf, LOAD_IMAGE_CLASSES)
@@ -414,11 +483,31 @@ def _patch_workflow(wf: dict, job: Job) -> dict:
         for nid in i2v_nodes:
             wf[nid].setdefault("inputs", {})["bypass"] = False
     else:
-        # T2V: bypass the image-injection nodes so they pass the latent
-        # through unchanged. LoadImage stays untouched (its filename
-        # default like 'Sulfur_Dust.webp' just isn't used when bypassed).
+        # T2V: bypass the image-injection nodes so the latent passes
+        # through unchanged. BUT - ComfyUI validates LoadImage's file
+        # before executing, so we must point it at an existing file even
+        # when bypassed. img2vid_placeholder.png is created by
+        # out/stage2_assets.py and shipped in comfyui/input/.
+        for nid in load_image_nodes:
+            wf[nid].setdefault("inputs", {})["image"] = "img2vid_placeholder.png"
         for nid in i2v_nodes:
             wf[nid].setdefault("inputs", {})["bypass"] = True
+
+    # 6. Loader filenames. Sulphur's workflow hardcodes filenames that
+    # don't match what we actually ship. Override each loader's filename
+    # input with what's on disk (see LOADER_REMAPS) and rewrite stale
+    # lora_name references via LORA_NAME_MAP.
+    for nid, node in wf.items():
+        ct = node.get("class_type")
+        if ct in LOADER_REMAPS:
+            ins = node.setdefault("inputs", {})
+            for input_name, our_file in LOADER_REMAPS[ct].items():
+                ins[input_name] = our_file
+        if ct in ("LoraLoaderModelOnly", "LoraLoader"):
+            ins = node.setdefault("inputs", {})
+            old = ins.get("lora_name")
+            if old in LORA_NAME_MAP:
+                ins["lora_name"] = LORA_NAME_MAP[old]
 
     return wf
 
@@ -500,7 +589,15 @@ class ComfyClient:
             json={"prompt": workflow, "client_id": CLIENT_ID},
             timeout=30,
         )
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # Surface ComfyUI's validation messages instead of a bare 400.
+            try:
+                err = r.json()
+            except Exception:
+                err = r.text
+            raise RuntimeError(
+                f"ComfyUI /prompt {r.status_code}: {json.dumps(err)[:1500]}"
+            )
         return r.json()["prompt_id"]
 
     def history(self, prompt_id: str) -> Optional[dict]:
