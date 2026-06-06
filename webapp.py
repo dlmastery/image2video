@@ -696,15 +696,20 @@ class ComfyClient:
             if sys.platform == "win32":
                 # CREATE_NEW_PROCESS_GROUP so taskkill /T can find the tree
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-            # --force-fp16 keeps sampling activations at FP16, which is
-            # important alongside GGUF Q3/Q4 weights on 16 GB-VRAM cards:
-            # the weights are tiny but activations otherwise default to
-            # FP32 and would OOM during attention. See the LTX-10Eros
-            # Vantage tutorial recipe.
+            # 16 GB VRAM tuning per the LTX-10Eros Vantage tutorial:
+            #  --force-fp16  keeps sampling activations at FP16 (vs FP32
+            #                default), important alongside GGUF Q3/Q4
+            #                UNET weights so attention buffers fit.
+            #  --lowvram     aggressively offloads models to CPU between
+            #                ops. Required because the canonical
+            #                gemma_3_12B_it.safetensors text encoder is
+            #                22.7 GB and the Q3_K_M UNET is 11 GB; sum
+            #                exceeds the 16 GB VRAM card, so they have
+            #                to swap on-demand.
             self.proc = subprocess.Popen(
                 [sys.executable, str(COMFY_DIR / "main.py"),
                  "--listen", COMFY_HOST, "--port", str(COMFY_PORT),
-                 "--force-fp16"],
+                 "--force-fp16", "--lowvram"],
                 cwd=str(COMFY_DIR),
                 stdout=open(log_path, "wb"),
                 stderr=open(err_path, "wb"),
