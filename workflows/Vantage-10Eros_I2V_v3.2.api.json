@@ -52,7 +52,13 @@
   "532": {
     "class_type": "ResizeImageMaskNode",
     "inputs": {
-      "scale_method": "scale by multiplier",
+      "resize_type": {
+        "key": "scale by multiplier",
+        "inputs": {
+          "multiplier": 0.5
+        }
+      },
+      "scale_method": "area",
       "input": [
         "531",
         0
@@ -110,6 +116,12 @@
   "770": {
     "class_type": "LTXVImgToVideoInplaceKJ",
     "inputs": {
+      "num_images": {
+        "key": "1",
+        "inputs": {
+          "strength_1": 1
+        }
+      },
       "vae": [
         "842",
         0
@@ -225,6 +237,12 @@
   "772": {
     "class_type": "LTXVImgToVideoInplaceKJ",
     "inputs": {
+      "num_images": {
+        "key": "1",
+        "inputs": {
+          "strength_1": 0.77
+        }
+      },
       "vae": [
         "842",
         0
@@ -355,10 +373,6 @@
         0
       ]
     }
-  },
-  "849": {
-    "class_type": "Fast Groups Bypasser (rgthree)",
-    "inputs": {}
   },
   "868": {
     "class_type": "Audio Duration (mtb)",
@@ -628,10 +642,6 @@
       ]
     }
   },
-  "755": {
-    "class_type": "RTXVideoSuperResolution",
-    "inputs": {}
-  },
   "802": {
     "class_type": "LTXTiledSampler",
     "inputs": {
@@ -701,7 +711,17 @@
   },
   "652": {
     "class_type": "Sigmas Easing",
-    "inputs": {}
+    "inputs": {
+      "easing_type": "cubic",
+      "easing_mode": "in_out",
+      "normalize_input": true,
+      "normalize_output": true,
+      "strength": 0.7,
+      "sigmas": [
+        "527",
+        0
+      ]
+    }
   },
   "593": {
     "class_type": "LTXVAudioVAEDecode",
@@ -723,13 +743,30 @@
         "855",
         0
       ],
-      "loop_count": "loop_count",
-      "filename_prefix": "filename_prefix",
-      "format": "format",
-      "pingpong": "pix_fmt",
-      "save_output": "crf",
+      "loop_count": 0,
+      "filename_prefix": "Eros/I2V",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 6,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "videopreview": {
+        "hidden": false,
+        "paused": false,
+        "params": {
+          "filename": "",
+          "subfolder": "Eros",
+          "type": "output",
+          "format": "video/h264-mp4",
+          "frame_rate": 24,
+          "workflow": "",
+          "fullpath": ""
+        }
+      },
       "images": [
-        "755",
+        "740",
         0
       ],
       "audio": [
@@ -757,10 +794,6 @@
       "unet_name": "sulpher/10Eros_v1_bf16_model.safetensors",
       "weight_dtype": "default"
     }
-  },
-  "856": {
-    "class_type": "Fast Groups Bypasser (rgthree)",
-    "inputs": {}
   },
   "865": {
     "class_type": "LoadAudio",
