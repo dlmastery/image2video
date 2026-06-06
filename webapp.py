@@ -441,6 +441,17 @@ def _load_workflows() -> None:
                 return i
         return 99
 
+    # For 10eros we ALWAYS prefer re-converting the UI source file each
+    # boot, because our converter is still evolving and a cached
+    # .api.json beside the source may be stale. Filter out .api.json
+    # files when the matching UI source exists.
+    if MODEL_FAMILY == "10eros":
+        ui_stems = {p.stem for p in candidates
+                    if not p.name.endswith(".api.json")}
+        candidates = [p for p in candidates
+                      if not (p.name.endswith(".api.json")
+                              and p.stem.replace(".api", "") in ui_stems)]
+
     sorted_paths = sorted(candidates, key=_prio)
     chosen: Optional[tuple[Path, dict]] = None
     for p in sorted_paths:
