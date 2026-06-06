@@ -171,6 +171,13 @@ foreach ($nodeDir in (Get-ChildItem $CustomDir -Directory)) {
 $WebReq = Join-Path $RepoRoot "requirements.txt"
 Run-Pip @("install","-r",$WebReq)
 
+# 3d. truststore + pip-system-certs. The corporate cert chain isn't in
+# Python's bundled certifi, so requests/urllib3 fail SSL verify on
+# huggingface_hub downloads. truststore.inject_into_ssl() makes
+# Python's ssl module read from the Windows cert store instead -
+# which already trusts the corporate root.
+Run-Pip @("install","truststore","pip-system-certs")
+
 # ----------------------------------------------------------------------
 # 4. Download Sulphur-2 checkpoint + Qwen prompt enhancer
 # ----------------------------------------------------------------------
@@ -185,19 +192,30 @@ New-Item -ItemType Directory -Force -Path $ModelsCache | Out-Null
 # Use huggingface_hub.snapshot_download via python so we get resume,
 # parallel chunks, and proper auth handling.
 $DownloadPy = @"
-import os, sys, ssl
+import os, sys
 
-# Disable SSL verification for corporate-cert boxes (same reason as the
-# CONDA_SSL_VERIFY / PIP_TRUSTED_HOST bypass at the top of setup.ps1).
-os.environ['CURL_CA_BUNDLE'] = ''
-os.environ['REQUESTS_CA_BUNDLE'] = ''
+# Corporate-cert SSL bypass. Two-layer approach:
+#  1) truststore.inject_into_ssl() teaches Python ssl to use the Windows
+#     trust store (which DOES trust the corporate root cert). This works
+#     for requests, urllib3, and huggingface_hub.
+#  2) If truststore isn't installed, fall back to monkey-patching every
+#     requests.Session to set verify=False. Less secure but unblocks
+#     the install on locked-down boxes.
 os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
 try:
-    import urllib3
+    import truststore
+    truststore.inject_into_ssl()
+    print('[ssl] using truststore (Windows cert store)')
+except ImportError:
+    print('[ssl] truststore unavailable; falling back to verify=False')
+    import ssl, urllib3, requests
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except Exception:
-    pass
-ssl._create_default_https_context = ssl._create_unverified_context
+    ssl._create_default_https_context = ssl._create_unverified_context
+    _orig_send = requests.adapters.HTTPAdapter.send
+    def _send(self, request, **kwargs):
+        kwargs['verify'] = False
+        return _orig_send(self, request, **kwargs)
+    requests.adapters.HTTPAdapter.send = _send
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
