@@ -1,0 +1,42 @@
+# --- repo-local big stuff: don't push to GitHub ------------------------
+# ComfyUI is cloned into here by setup.ps1; it has its own git
+comfyui/
+# Model weights — multi-GB safetensors, GGUF, etc.
+models/
+*.safetensors
+*.gguf
+*.pth
+*.onnx
+*.bin
+
+# Per-job working dirs (uploaded images, intermediate frames, output MP4s)
+image2video_jobs/
+
+# Conda env (if a user makes one inside the repo by mistake)
+.venv/
+env/
+.conda/
+
+# Python build artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Logs
+*.log
+out/
+logs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Agent runtime state
+.claude/
+.playwright-mcp/
+
+# PowerShell heredoc workaround for git commit -F
+.commit-msg.tmp

@@ -1,0 +1,22 @@
+# Python deps for the image2video Flask webapp.
+# These get installed into the `img2vid` conda env by setup.ps1.
+# ComfyUI brings its own requirements (torch, xformers, etc.) into the
+# same env; this file is only the *extra* deps our webapp needs.
+
+flask>=3.0,<4.0
+requests>=2.32
+websocket-client>=1.7         # used by ComfyUI API examples for /ws progress
+opencv-python>=4.10           # last-frame extraction for video extension
+imageio[ffmpeg]>=2.34
+huggingface_hub>=0.24
+
+# Qwen prompt enhancer — 4-bit via bitsandbytes, lazy-loaded.
+# torch is provided by ComfyUI's requirements.txt; do not pin it here.
+transformers>=4.45,<5.0
+accelerate>=0.34
+bitsandbytes>=0.43            # Windows wheels exist on PyPI for cu121
+sentencepiece>=0.2            # Qwen tokenizer dep
+einops>=0.8
+
+# Pillow comes in via opencv/imageio but pin a min for safety
+Pillow>=10.0
