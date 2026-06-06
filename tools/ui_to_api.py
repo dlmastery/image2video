@@ -125,24 +125,24 @@ def _map_widgets(class_info: dict, widget_vals: Any) -> dict[str, Any]:
             val = widget_vals[idx]
             out[k] = val
             idx += 1
-            # COMFY_DYNAMICCOMBO_V3 expects a NESTED value:
-            #   {"key": "<selected option>",
-            #    "inputs": {"<nested_input>": <value>, ...}}
-            # rather than flat sibling keys at the node level.
+            # COMFY_DYNAMICCOMBO_V3: the selector value stays as-is
+            # at the parent key, and each nested input is emitted as a
+            # sibling under the DOTTED name `{parent}.{nested_name}`.
+            # (Verified by ComfyUI's own validation error message
+            # 'Required input is missing: multiplier, input_name:
+            # resize_type.multiplier'.)
             if _is_dynamic_combo(v):
                 opts = []
                 if len(v) >= 2 and isinstance(v[1], dict):
                     opts = v[1].get("options", []) or []
-                nested_values: dict[str, Any] = {}
                 for opt in opts:
                     if isinstance(opt, dict) and opt.get("key") == val:
                         nested = (opt.get("inputs") or {}).get("required", {}) or {}
                         for nk, nv in nested.items():
                             if _is_widget_input(nv) and idx < len(widget_vals):
-                                nested_values[nk] = widget_vals[idx]
+                                out[f"{k}.{nk}"] = widget_vals[idx]
                                 idx += 1
                         break
-                out[k] = {"key": val, "inputs": nested_values}
     return out
 
 
