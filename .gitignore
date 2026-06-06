@@ -34,8 +34,10 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Agent runtime state
-.claude/
+# Agent runtime state - but keep .claude/skills/ checked in so the
+# working-memory SKILL.md ships with the repo.
+.claude/*
+!.claude/skills/
 .playwright-mcp/
 
 # PowerShell heredoc workaround for git commit -F
