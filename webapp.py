@@ -654,6 +654,22 @@ def _patch_workflow(wf: dict, job: Job) -> dict:
             if old in LORA_NAME_MAP:
                 ins["lora_name"] = LORA_NAME_MAP[old]
 
+    # 6b. UNETLoader -> UnetLoaderGGUF swap (when USE_GGUF is on).
+    # The Vantage 10Eros workflow ships with a stock UNETLoader pointing
+    # at a BF16 safetensors AND a UnetLoaderGGUF that's bypassed by
+    # default. The converter drops the bypassed node, leaving only the
+    # BF16 path - which would load a 46 GB file we don't have. Swap the
+    # class to GGUF and point at our quant.
+    if USE_GGUF:
+        for nid, node in wf.items():
+            if node.get("class_type") == "UNETLoader":
+                node["class_type"] = "UnetLoaderGGUF"
+                ins = node.setdefault("inputs", {})
+                ins["unet_name"] = GGUF_NAME
+                # UNETLoader had a weight_dtype input; UnetLoaderGGUF
+                # doesn't. Drop it so it doesn't leak through.
+                ins.pop("weight_dtype", None)
+
     return wf
 
 
