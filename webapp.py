@@ -85,14 +85,29 @@ SULPHUR_TEXT_ENCODER_NAME = (
 SULPHUR_AUDIO_VAE_NAME = "sulphur_audio_vae.safetensors"
 SULPHUR_UPSCALER_NAME = "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
 
+# GGUF-mode toggle. When IMG2VID_USE_GGUF=1, the patcher rewrites the
+# unified CheckpointLoaderSimple into UnetLoaderGGUF + VAELoader so the
+# UNET gets loaded from a Q-quantized GGUF instead of the 29 GB FP8
+# safetensors. Cuts Windows commit budget by 14-19 GB depending on the
+# quant level, lifting the pagefile blocker.
+USE_GGUF = os.getenv("IMG2VID_USE_GGUF", "1") == "1"
+SULPHUR_GGUF_QUANT = os.getenv("IMG2VID_GGUF_QUANT", "Q4_K_M")
+SULPHUR_GGUF_NAME = f"sulphur_dev-{SULPHUR_GGUF_QUANT}.gguf"
+SULPHUR_VAE_NAME = "sulphur_vae.safetensors"
+
 LOADER_REMAPS = {
     "CheckpointLoaderSimple":  {"ckpt_name": SULPHUR_CKPT_NAME},
     "CheckpointLoader":        {"ckpt_name": SULPHUR_CKPT_NAME},
-    # LTXVAudioVAELoader actually scans models/checkpoints/ (it pulls
-    # the audio-VAE layers OUT of the unified Sulphur checkpoint),
-    # not a separate audio_vae/ dir despite the loader name.
-    "LTXVAudioVAELoader":      {"ckpt_name": SULPHUR_CKPT_NAME},
-    "LTXAVTextEncoderLoader":  {"ckpt_name": SULPHUR_CKPT_NAME,
+    # LTXVAudioVAELoader + LTXAVTextEncoderLoader both scan
+    # models/checkpoints/. Originally they'd pull their layers from the
+    # unified 29 GB FP8 ckpt, but mmap-slicing that giant file under
+    # commit-budget pressure caused a Windows access violation in
+    # comfy.utils.load_torch_file. Switch them to the SPLIT files
+    # (sulphur_audio_vae.safetensors, sulphur_text_encoder.safetensors)
+    # which we copy from models/vae and models/text_encoders into
+    # models/checkpoints during stage 4.
+    "LTXVAudioVAELoader":      {"ckpt_name": SULPHUR_AUDIO_VAE_NAME},
+    "LTXAVTextEncoderLoader":  {"ckpt_name": "sulphur_text_encoder.safetensors",
                                 "text_encoder": SULPHUR_TEXT_ENCODER_NAME},
     "LatentUpscaleModelLoader": {"model_name": SULPHUR_UPSCALER_NAME},
 }
@@ -289,6 +304,56 @@ def _apply_compat(wf: dict) -> dict:
             ins.setdefault(k, v)
     return wf
 
+def _apply_gguf_swap(wf: dict) -> dict:
+    """Replace every CheckpointLoaderSimple with UnetLoaderGGUF +
+    VAELoader and rewire every consumer.
+
+    CheckpointLoaderSimple exposes 3 outputs (MODEL=slot 0, CLIP=slot 1,
+    VAE=slot 2). GGUF only carries the UNET, so we split it:
+      old [ckpt_id, 0]  (MODEL) ->  [ckpt_id + '_unet', 0]
+      old [ckpt_id, 2]  (VAE)   ->  [ckpt_id + '_vae',  0]
+    Sulphur's workflow doesn't read CLIP from the checkpoint (text
+    encoding goes through LTXAVTextEncoderLoader instead), so slot 1
+    has no consumers and we ignore it.
+
+    Cuts mmap commit budget from ~29 GB (FP8 ckpt) to ~14-22 GB (GGUF
+    quant + small VAE) and lifts the Windows pagefile blocker.
+    """
+    ckpt_ids = [nid for nid, n in wf.items()
+                if n.get("class_type") == "CheckpointLoaderSimple"]
+    if not ckpt_ids:
+        return wf
+    new_nodes: dict[str, dict] = {}
+    remap: dict[str, dict[int, list]] = {}   # ckpt_id -> {old_slot: new_ref}
+    for ckpt_id in ckpt_ids:
+        unet_id = f"{ckpt_id}_unet"
+        vae_id  = f"{ckpt_id}_vae"
+        new_nodes[unet_id] = {
+            "class_type": "UnetLoaderGGUF",
+            "inputs": {"unet_name": SULPHUR_GGUF_NAME},
+        }
+        new_nodes[vae_id] = {
+            "class_type": "VAELoader",
+            "inputs": {"vae_name": SULPHUR_VAE_NAME},
+        }
+        remap[ckpt_id] = {
+            0: [unet_id, 0],   # MODEL
+            2: [vae_id, 0],    # VAE
+        }
+    # Rewire every consumer of [ckpt_id, slot]
+    for n in wf.values():
+        ins = n.get("inputs", {})
+        for k, v in list(ins.items()):
+            if isinstance(v, list) and len(v) >= 2 and str(v[0]) in remap:
+                slot = int(v[1])
+                if slot in remap[str(v[0])]:
+                    ins[k] = remap[str(v[0])][slot]
+    # Insert the new nodes and remove the old CheckpointLoaderSimple
+    wf.update(new_nodes)
+    for nid in ckpt_ids:
+        wf.pop(nid, None)
+    return wf
+
 # Workflows keyed by mode ("t2v" / "i2v"). We use the SAME underlying
 # Sulphur JSON for both modes - the LTXVImgToVideoInplace nodes have a
 # bypass flag the patcher toggles. See _patch_workflow.
@@ -413,6 +478,8 @@ def _patch_workflow(wf: dict, job: Job) -> dict:
     """
     wf = json.loads(json.dumps(wf))  # deep copy
     _apply_compat(wf)                # rewrite class_types we don't have
+    if USE_GGUF:
+        _apply_gguf_swap(wf)         # CheckpointLoaderSimple -> UnetGGUF + VAELoader
 
     pos_text = job.enhanced_prompt or job.prompt or ""
     neg_text = job.negative_prompt or ""
@@ -584,10 +651,12 @@ class ComfyClient:
         return bool(self.proc and self.proc.poll() is None)
 
     def submit(self, workflow: dict) -> str:
+        # Generous timeout because ComfyUI's /prompt endpoint may block
+        # while it validates + warms its node graph on the first call.
         r = requests.post(
             f"{COMFY_URL}/prompt",
             json={"prompt": workflow, "client_id": CLIENT_ID},
-            timeout=30,
+            timeout=180,
         )
         if r.status_code >= 400:
             # Surface ComfyUI's validation messages instead of a bare 400.
@@ -779,23 +848,29 @@ def _collect_output(job: Job, prompt_id: str) -> Optional[Path]:
                     )
                     tmp.unlink(missing_ok=True)
                     return dst
-        # Some output nodes report `images` with a .webp animation
+        # Some output nodes (e.g. SaveVideo) report under `images` with
+        # animated=True and a .mp4 filename. Handle .mp4/.mov/.mkv as
+        # native videos; re-encode .webp/.gif/.png animations to MP4.
         for v in node_outs.get("images", []) or []:
-            if not v["filename"].lower().endswith((".webp", ".gif", ".png")):
-                continue
+            fn = v["filename"].lower()
             data = COMFY.get_image(v["filename"], v.get("subfolder", ""),
                                    v.get("type", "output"))
-            tmp = job.dir / v["filename"]
-            tmp.write_bytes(data)
-            dst = job.dir / "output.mp4"
-            subprocess.run(
-                [FFMPEG, "-y", "-i", str(tmp),
-                 "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                 "-movflags", "+faststart", str(dst)],
-                check=True, capture_output=True,
-            )
-            tmp.unlink(missing_ok=True)
-            return dst
+            if fn.endswith((".mp4", ".mov", ".mkv")):
+                dst = job.dir / "output.mp4"
+                dst.write_bytes(data)
+                return dst
+            if fn.endswith((".webp", ".gif", ".png")):
+                tmp = job.dir / v["filename"]
+                tmp.write_bytes(data)
+                dst = job.dir / "output.mp4"
+                subprocess.run(
+                    [FFMPEG, "-y", "-i", str(tmp),
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                     "-movflags", "+faststart", str(dst)],
+                    check=True, capture_output=True,
+                )
+                tmp.unlink(missing_ok=True)
+                return dst
     return None
 
 def _concat_with_parent(job: Job, new_clip: Path) -> Path:

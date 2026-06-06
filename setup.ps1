@@ -300,6 +300,18 @@ Write-Host "Stage 3: Gemma encoder + audio VAE + LoRAs (~22 GB; longest step)"
 Run-Conda @("run","-n",$EnvName,"--no-capture-output","python",
             (Join-Path $RepoRoot "tools\download_stage3_assets.py"))
 
+# Stage 4: GGUF UNET + split visual VAE + split text encoder. Cuts the
+# main UNET commit budget from 29 GB (FP8) to 14 GB (Q4_K_M), avoiding
+# the Windows 'paging file too small' error during model load. Variant
+# is configurable via env var IMG2VID_GGUF_QUANT (Q3_K_S=10 GB,
+# Q4_K_M=14 GB, Q5_K_M=16 GB, Q8_0=23 GB). The webapp picks GGUF mode
+# when IMG2VID_USE_GGUF=1 (default).
+Write-Host ""
+$_q = if ($env:IMG2VID_GGUF_QUANT) { $env:IMG2VID_GGUF_QUANT } else { "Q4_K_M" }
+Write-Host "Stage 4: GGUF UNET ($_q) + split VAE/text encoder (~15 GB)"
+Run-Conda @("run","-n",$EnvName,"--no-capture-output","python",
+            (Join-Path $RepoRoot "tools\download_stage4_gguf.py"))
+
 # ----------------------------------------------------------------------
 # 5. cuDNN DLL discovery patch (Windows-only)
 # ----------------------------------------------------------------------
