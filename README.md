@@ -31,6 +31,15 @@ preset, upload your source image, tweak the prompt if needed, hit
 Generate. Advanced settings (negative prompt, seed, dims) collapse out
 of the way until you need them.
 
+### 4 · Watch it generate
+![Step 4 — live generation](docs/screenshots/04_generating.png)
+
+Big spinning ring, current phase, elapsed time, step pills (queued →
+loading models → sampling → decoding → done), live log tail of what
+ComfyUI is doing right now (toggleable to save bandwidth), and a
+scrolling gallery of generated artifacts (intermediate frames + probes)
+as they appear.
+
 ## What you get
 
 | Mode | Input | Output |
