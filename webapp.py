@@ -620,13 +620,58 @@ def _patch_workflow(wf: dict, job: Job) -> dict:
         if "steps" in si:
             si["steps"] = int(job.steps)
 
-    # 4. Width / height / frame count on every latent.
+    # 4. Width / height / frame count.
+    # The Vantage 10Eros workflow drives dims from INTConstants that feed
+    # an ImageResizeKJv2 - that's the PRIMARY dim setting. The latent's
+    # width/height inputs are CONNECTIONS to GetImageSize -> Resize, so
+    # they auto-derive once we patch the resize target. Patching latents
+    # with literal width/height (the old behaviour) overrides those
+    # connections with literals that don't match the resized image's
+    # actual dims -> sampler operates on a latent shape that has nothing
+    # to do with the conditioning image, and output is colored noise.
+    #
+    # Correct pipeline: patch upstream INTConstants of ImageResizeKJv2.
+    # If no such resize node exists (simpler workflows) fall back to
+    # patching the latent directly.
+    resize_nodes = _nodes_by_class(wf, ("ImageResizeKJv2", "ImageResizeKJ",
+                                        "ImageScale", "ImageScaleBy"))
+    patched_via_resize = False
+    for nid in resize_nodes:
+        ins = wf[nid].setdefault("inputs", {})
+        for role, target in (("width", int(job.width)), ("height", int(job.height))):
+            ref = ins.get(role)
+            if isinstance(ref, list) and len(ref) >= 1:
+                src_id = str(ref[0])
+                src = wf.get(src_id)
+                if src and src.get("class_type") in ("INTConstant", "PrimitiveInt"):
+                    src.setdefault("inputs", {})["value"] = target
+                    patched_via_resize = True
+                else:
+                    # Direct connection to something else - just overwrite
+                    # the ref with a literal value.
+                    ins[role] = target
+                    patched_via_resize = True
+            elif role in ins:
+                ins[role] = target
+                patched_via_resize = True
+
+    # Latent dims: only force-write when the workflow has NO resize chain
+    # (otherwise the latent's connections will derive the right values).
+    if not patched_via_resize:
+        for nid in _nodes_by_class(wf, LATENT_CLASSES):
+            li = wf[nid].setdefault("inputs", {})
+            if "width" in li and not isinstance(li["width"], list):
+                li["width"]  = int(job.width)
+            if "height" in li and not isinstance(li["height"], list):
+                li["height"] = int(job.height)
+
+    # Frame count is always safe to set on latents (connection-shaped
+    # length inputs are rare; usually it's a literal or derived from a
+    # primitive node).
     for nid in _nodes_by_class(wf, LATENT_CLASSES):
         li = wf[nid].setdefault("inputs", {})
-        if "width" in li:  li["width"]  = int(job.width)
-        if "height" in li: li["height"] = int(job.height)
         for k in ("length", "num_frames", "frame_count", "video_length"):
-            if k in li:
+            if k in li and not isinstance(li[k], list):
                 li[k] = int(job.frames)
 
     # 5. I2V image injection. Sulphur's workflow has
