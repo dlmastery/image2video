@@ -737,6 +737,39 @@ def _patch_workflow(wf: dict, job: Job) -> dict:
                 # doesn't. Drop it so it doesn't leak through.
                 ins.pop("weight_dtype", None)
 
+    # 7. Photoreal mode (default unless the prompt asks for anime/stylized).
+    # Without these patches the Vantage workflow defaults to:
+    #   - OmniNFT LoRA @ 0.8 strength  -> anime-stylizes everything
+    #   - STGGuider cfg_values "2,1.5,1,1,..."  -> CFG drops to 1 after
+    #     step 2, so the negative prompt becomes a mathematical no-op for
+    #     11 of 13 sampler steps (verified by reading STGGuider source)
+    # Both of those combine to produce "generic anime woman" even when
+    # the prompt is "make the person smile gently" with a photoreal
+    # source image. See out/instrument_workflow_photoreal.py for the
+    # standalone probe that proved these are load-bearing.
+    prompt_text = (job.prompt or "").lower()
+    wants_anime = any(k in prompt_text for k in
+                       ("anime", "cartoon", "stylized", "manga", "illustration"))
+    if not wants_anime:
+        # OmniNFT off — the LoRA is an anime stylizer; with strength=0 the
+        # Power Lora Loader skips applying it. Set on=False too so the UI
+        # toggle reflects the actual state.
+        for node in wf.values():
+            if node.get("class_type") == "Power Lora Loader (rgthree)":
+                for v in node.get("inputs", {}).values():
+                    if isinstance(v, dict) and "OmniNFT" in str(v.get("lora", "")):
+                        v["strength"] = 0.0
+                        v["on"] = False
+        # Extended CFG schedule so the negative prompt steers across all
+        # steps, not just the first two. Values stay within STGGuider's
+        # accepted range. STG values mirror CFG (TenStrip default pattern).
+        photoreal_cfg = "3,2.5,2,2,1.8,1.5,1.5,1.3,1.2,1.2,1.1,1,1"
+        for node in wf.values():
+            if node.get("class_type") == "STGGuiderAdvanced":
+                ins = node.setdefault("inputs", {})
+                ins["cfg_values"] = photoreal_cfg
+                ins["stg_scale_values"] = photoreal_cfg
+
     return wf
 
 
