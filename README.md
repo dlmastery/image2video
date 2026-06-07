@@ -9,6 +9,28 @@ Built on **LTX-2.3** with the community **10Eros** fine-tune and
 Drop in a portrait, pick a style, type what should happen — get back a
 cinematic short clip with synced audio.
 
+## Walkthrough
+
+### 1 · Pick what to make
+![Step 1 — pick mode](docs/screenshots/01_home.png)
+
+Image-to-Video animates a still photo, Text-to-Video starts from a prompt
+alone, Extend continues a previously generated clip from its last frame.
+
+### 2 · Pick a style preset (with editable prompt)
+![Step 2 — pick a style](docs/screenshots/02_presets.png)
+
+Each preset ships with a short default prompt you can edit right on the
+card before continuing. Optional anime stylization is one of the presets.
+
+### 3 · Describe & go
+![Step 3 — describe & go](docs/screenshots/03_describe.png)
+
+Set duration in seconds (auto-converted to frames), pick a resolution
+preset, upload your source image, tweak the prompt if needed, hit
+Generate. Advanced settings (negative prompt, seed, dims) collapse out
+of the way until you need them.
+
 ## What you get
 
 | Mode | Input | Output |

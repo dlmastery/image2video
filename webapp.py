@@ -1286,6 +1286,78 @@ def job_status(job_id):
         parent_job_id=job.parent_job_id,
     )
 
+@app.get("/job/<job_id>/logs.json")
+def job_logs(job_id):
+    """Real-time log tail of the most recent ComfyUI output lines.
+    Frontend polls this to show what's happening at every step
+    (model loads, text encoding, sampler step %, VAE decode, mux).
+    Returns: {lines:[...], sampler:'8/13 [02:14<03:30, 26.7s/it]'}"""
+    job = JOBS.get(job_id)
+    if not job: abort(404)
+    log_path = OUT_DIR / "comfy.err"
+    lines, sampler = [], None
+    if log_path.is_file():
+        # Read last ~16 KB — enough for several minutes of log
+        sz = log_path.stat().st_size
+        with open(log_path, "rb") as f:
+            if sz > 16384:
+                f.seek(-16384, 2)
+                f.readline()  # discard partial line
+            tail = f.read().decode("utf-8", errors="replace").splitlines()
+        # ANSI strip
+        import re
+        ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+        cleaned = []
+        for ln in tail:
+            ln = ansi.sub("", ln).rstrip("\r").rstrip()
+            if not ln: continue
+            cleaned.append(ln)
+        lines = cleaned[-80:]
+        # Pull the most recent sampler progress line
+        for ln in reversed(lines):
+            m = re.search(r"(\d+/\d+ \[[0-9:]+<[0-9:]+, [0-9.]+s/it\])", ln)
+            if m:
+                sampler = m.group(1); break
+    return jsonify(lines=lines, sampler=sampler,
+                   phase=job.phase, current_step=job.current_step,
+                   total_steps=job.total_steps)
+
+@app.get("/job/<job_id>/artifacts.json")
+def job_artifacts(job_id):
+    """List recent generated images (intermediate frames, debug probes,
+    VAE-decoded outputs) for the artifact scroller."""
+    job = JOBS.get(job_id)
+    if not job: abort(404)
+    items = []
+    try:
+        # Scan ComfyUI's output PROBE/ dir + the job's own dir.
+        from pathlib import Path as _P
+        comfy_out = _P(__file__).parent / "comfyui" / "output"
+        for sub in ("PROBE", "Eros"):
+            d = comfy_out / sub
+            if not d.is_dir(): continue
+            for p in sorted(d.glob("*.png"),
+                            key=lambda x: x.stat().st_mtime, reverse=True)[:20]:
+                items.append({
+                    "name": p.name,
+                    "url":  f"/artifact/{sub}/{p.name}",
+                    "mtime": int(p.stat().st_mtime),
+                    "size": p.stat().st_size,
+                })
+    except Exception as e:
+        return jsonify(items=[], error=str(e))
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return jsonify(items=items[:30])
+
+@app.get("/artifact/<sub>/<name>")
+def artifact_serve(sub, name):
+    """Serve a generated probe/preview image."""
+    if sub not in ("PROBE", "Eros") or "/" in name or "\\" in name:
+        abort(404)
+    from pathlib import Path as _P
+    d = _P(__file__).parent / "comfyui" / "output" / sub
+    return send_from_directory(str(d), name, mimetype="image/png", conditional=True)
+
 @app.get("/job/<job_id>/output")
 def job_output(job_id):
     job = JOBS.get(job_id)
@@ -1610,7 +1682,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <div class="hero">
-    <div class="pill"><span class="dot"></span> Local · GPU ready · LTX-2.3 · 10Eros</div>
+    <div class="pill"><span class="dot"></span> Local · GPU ready</div>
     <h1>Bring stills to <span class="acc">life.</span></h1>
     <p>Drop in a portrait, pick a style, describe the motion. Cinematic short clips
        with synced audio — generated on your own GPU in minutes.</p>
@@ -1680,14 +1752,34 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <label>Prompt — describe what you want to happen</label>
         <textarea name="prompt" id="prompt-input" placeholder=""></textarea>
+        <div class="row" style="margin-top:14px;">
+          <div>
+            <label>Duration (seconds)</label>
+            <input name="duration" id="duration-input" type="number"
+                   value="2" min="1" max="10" step="1">
+          </div>
+          <div>
+            <label>Resolution preset</label>
+            <select id="res-preset" name="res_preset"
+                    style="width:100%;padding:11px 14px;background:rgba(7,10,18,0.5);
+                           color:var(--ink-0);border:1px solid var(--line);
+                           border-radius:10px;font:14px inherit;">
+              <option value="portrait">Portrait 768×1024 (fast)</option>
+              <option value="square">Square 768×768</option>
+              <option value="landscape">Landscape 1024×768</option>
+              <option value="wide">Wide 1280×768 (slow)</option>
+              <option value="vertical">Vertical 512×768 (smoke)</option>
+            </select>
+          </div>
+        </div>
         <details>
-          <summary>Advanced settings</summary>
+          <summary>Advanced settings (auto-set by Duration + Resolution)</summary>
           <label>Negative prompt</label>
           <textarea name="negative" id="negative-input"></textarea>
           <div class="row">
-            <div><label>Width</label><input name="width" id="width-input" type="number" value="768"></div>
-            <div><label>Height</label><input name="height" id="height-input" type="number" value="1024"></div>
-            <div><label>Frames</label><input name="frames" id="frames-input" type="number" value="49"></div>
+            <div><label>Width</label><input name="width" id="width-input" type="number" value="768" readonly></div>
+            <div><label>Height</label><input name="height" id="height-input" type="number" value="1024" readonly></div>
+            <div><label>Frames (auto-calc'd from duration)</label><input name="frames" id="frames-input" type="number" value="49" readonly></div>
             <div><label>Steps</label><input name="steps" id="steps-input" type="number" value="13"></div>
             <div><label>Seed (0 = random)</label><input name="seed" type="number" value="0"></div>
           </div>
@@ -1721,8 +1813,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <footer>
-    <p>Powered by LTX-2.3 · 10Eros UNET · Vantage workflow · TenStrip's 10S nodes<br>
-       Running locally on your RTX 4090. No data leaves your machine.</p>
+    <p>Running locally on your own GPU. No data leaves your machine.</p>
   </footer>
 </div>
 
@@ -1732,47 +1823,55 @@ INDEX_HTML = r"""<!doctype html>
   // Pulls from the lessons we learned: 17-frame minimum for I2V due to audio
   // sync chain, photoreal CFG works better when frames are ≥49.
   const PRESETS = {
+    // Default prompts are intentionally SHORT and natural — Qwen
+    // enhancement (if enabled) and the negative prompt do the heavy
+    // lifting. Easier for new users to edit one sentence than a paragraph.
     i2v: [
-      { id: 'cinematic_portrait', icon: '🎞️', name: 'Cinematic Portrait',
-        desc: 'Close-up, gentle motion, photorealistic. Best for portraits.',
-        prompt: 'cinematic close-up portrait, soft gentle expression forming, subtle breathing motion, photorealistic, sharp focus, natural skin texture, studio lighting',
-        negative: 'anime, cartoon, drawing, illustration, painting, 3d render, cgi, stylized, blurry, distorted, deformed',
+      { id: 'smile', icon: '😊', name: 'Smile',
+        desc: 'Make the person smile gently.',
+        prompt: 'make the person smile gently',
+        negative: 'anime, cartoon, blurry, distorted',
         width: 768, height: 1024, frames: 49, steps: 13 },
-      { id: 'talking_head', icon: '🗣️', name: 'Talking Head',
-        desc: 'Subject speaks; lips move. Good for vlogs, voiceovers.',
-        prompt: 'medium close-up of the subject speaking naturally, lips moving, subtle head motion, natural eye contact, professional video',
-        negative: 'anime, cartoon, blurry, distorted, frozen pose, motionless',
+      { id: 'talking', icon: '🗣️', name: 'Talking',
+        desc: 'Subject talks naturally to camera.',
+        prompt: 'the person speaks naturally to the camera',
+        negative: 'anime, cartoon, frozen, motionless',
         width: 768, height: 1024, frames: 97, steps: 20 },
-      { id: 'landscape_pan', icon: '🏞️', name: 'Landscape Pan',
-        desc: 'Slow camera pan across the scene. Best for sceneries.',
-        prompt: 'slow cinematic camera pan from left to right across the landscape, gentle wind in foliage, atmospheric, golden hour lighting',
-        negative: 'anime, cartoon, distorted perspective, static frame',
-        width: 1280, height: 768, frames: 97, steps: 20 },
+      { id: 'walk_toward', icon: '🚶', name: 'Walk towards camera',
+        desc: 'Subject walks forward into frame.',
+        prompt: 'the person walks towards the camera',
+        negative: 'anime, cartoon, distorted, deformed',
+        width: 768, height: 1024, frames: 97, steps: 20 },
+      { id: 'look_around', icon: '👀', name: 'Look around',
+        desc: 'Subject glances around the scene.',
+        prompt: 'the person looks around the room',
+        negative: 'anime, cartoon, frozen, motionless',
+        width: 768, height: 1024, frames: 49, steps: 13 },
       { id: 'anime_motion', icon: '🌸', name: 'Anime Motion',
-        desc: 'Stylized motion (enables OmniNFT). Use only if you want anime.',
-        prompt: 'anime style motion, smooth animation, expressive character, vibrant colors',
-        negative: 'blurry, distorted, deformed, photorealistic',
+        desc: 'Stylized motion (enables OmniNFT).',
+        prompt: 'anime style smooth motion',
+        negative: 'blurry, distorted, photorealistic',
         width: 768, height: 1024, frames: 49, steps: 13 },
       { id: 'custom', icon: '⚙️', name: 'Custom',
-        desc: 'Empty prompts, you fill everything in.',
-        prompt: '', negative: '',
+        desc: 'Empty — you write the prompt.',
+        prompt: '', negative: 'anime, cartoon, blurry, distorted',
         width: 768, height: 1024, frames: 49, steps: 13 },
     ],
     t2v: [
-      { id: 'cinematic_scene', icon: '🎞️', name: 'Cinematic Scene',
-        desc: 'Photorealistic scene from a prompt alone.',
-        prompt: 'cinematic shot of [your scene], photorealistic, 8k, sharp focus, atmospheric lighting',
+      { id: 'scene', icon: '🎬', name: 'Cinematic Scene',
+        desc: 'Describe a scene; we render it cinematically.',
+        prompt: 'a cinematic scene of ',
         negative: 'anime, cartoon, blurry, low quality',
-        width: 1280, height: 768, frames: 97, steps: 20 },
-      { id: 'nature_doc', icon: '🌿', name: 'Nature Doc',
-        desc: 'Slow, observational, BBC Earth style.',
-        prompt: 'slow cinematic nature documentary shot, [your subject], observational camera, natural lighting, photorealistic',
-        negative: 'anime, cartoon, fast motion, distorted',
-        width: 1280, height: 768, frames: 97, steps: 20 },
+        width: 1024, height: 768, frames: 97, steps: 20 },
+      { id: 'nature', icon: '🌿', name: 'Nature Doc',
+        desc: 'BBC Earth-style nature shot.',
+        prompt: 'a slow nature documentary shot of ',
+        negative: 'anime, cartoon, fast motion',
+        width: 1024, height: 768, frames: 97, steps: 20 },
       { id: 'custom', icon: '⚙️', name: 'Custom',
-        desc: 'Empty prompts.',
-        prompt: '', negative: '',
-        width: 1280, height: 768, frames: 97, steps: 20 },
+        desc: 'Empty — you write the prompt.',
+        prompt: '', negative: 'anime, cartoon, blurry, distorted',
+        width: 1024, height: 768, frames: 97, steps: 20 },
     ],
     // Extend mode is special: presets come from /jobs.json (your prior
     // completed renders). Populated dynamically when step 2 opens.
@@ -1851,18 +1950,35 @@ INDEX_HTML = r"""<!doctype html>
       });
       return;
     }
-    // Regular style preset picker
+    // Regular style preset picker — show default prompt right on the card,
+    // editable inline so users can tweak before continuing to step 3.
     grid.innerHTML = '';
     (PRESETS[mode] || []).forEach(p => {
+      // Work on a copy so editing one preset doesn't mutate the original
+      const pc = JSON.parse(JSON.stringify(p));
       const div = document.createElement('div');
-      div.className = 'card'; div.dataset.preset = p.id;
-      div.innerHTML = `<div class="icon">${p.icon}</div>
-                       <div class="name">${p.name}</div>
-                       <div class="desc">${p.desc}</div>`;
-      div.onclick = () => {
+      div.className = 'card'; div.dataset.preset = pc.id;
+      div.innerHTML = `
+        <div class="icon">${pc.icon}</div>
+        <div class="name">${pc.name}</div>
+        <div class="desc">${pc.desc}</div>
+        <label style="margin:14px 0 5px;display:block;color:var(--ink-2);font-size:12px;">
+          Default prompt — edit below
+        </label>
+        <textarea class="preset-prompt"
+          style="width:100%;padding:8px 10px;background:rgba(7,10,18,0.55);
+                 color:var(--ink-0);border:1px solid var(--line);border-radius:8px;
+                 font:13px/1.45 inherit;font-family:inherit;min-height:60px;resize:vertical;"
+          placeholder="${pc.prompt ? '' : 'Write your prompt here…'}"
+          onclick="event.stopPropagation()"
+          oninput="event.stopPropagation()">${pc.prompt || ''}</textarea>`;
+      const textarea = div.querySelector('.preset-prompt');
+      textarea.addEventListener('input', () => { pc.prompt = textarea.value; });
+      div.onclick = (e) => {
+        if (e.target === textarea) return;  // clicking the textarea shouldn't toggle
         document.querySelectorAll('[data-preset]').forEach(x => x.classList.remove('sel'));
         div.classList.add('sel');
-        preset = p;
+        preset = pc;  // selected preset carries the (possibly edited) prompt
         document.getElementById('b2-next').disabled = false;
       };
       grid.appendChild(div);
@@ -1871,6 +1987,19 @@ INDEX_HTML = r"""<!doctype html>
   document.getElementById('b2-next').onclick = () => {
     applyPreset(); showStep(3);
   };
+
+  // ============ Resolution presets (step 3) ============
+  const RES = {
+    portrait:  { w: 768,  h: 1024 },
+    square:    { w: 768,  h: 768  },
+    landscape: { w: 1024, h: 768  },
+    wide:      { w: 1280, h: 768  },
+    vertical:  { w: 512,  h: 768  },
+  };
+  // Vantage MathExpression: frames = ceil((ceil(s)*24)/8)*8 + 1
+  function framesFromSeconds(s) {
+    return Math.ceil((Math.ceil(Math.max(1, parseInt(s||'2',10))) * 24) / 8) * 8 + 1;
+  }
 
   // ============ Step 3: apply preset to form, configure submission ============
   function applyPreset() {
@@ -1906,8 +2035,26 @@ INDEX_HTML = r"""<!doctype html>
       ? '/extend/' + extendParentId
       : '/generate/' + mode;
   }
+
+  // Live Duration → Frames + Resolution → Width/Height (Step 3)
+  const durInput = document.getElementById('duration-input');
+  const framesIn = document.getElementById('frames-input');
+  const widthIn  = document.getElementById('width-input');
+  const heightIn = document.getElementById('height-input');
+  const resSel   = document.getElementById('res-preset');
+  function syncDims() {
+    if (durInput && framesIn) framesIn.value = framesFromSeconds(durInput.value);
+    if (resSel && widthIn && heightIn) {
+      const r = RES[resSel.value] || RES.portrait;
+      widthIn.value = r.w; heightIn.value = r.h;
+    }
+  }
+  if (durInput) durInput.addEventListener('input', syncDims);
+  if (resSel)   resSel.addEventListener('change', syncDims);
+
   // Spinner on submit
   document.getElementById('genForm').addEventListener('submit', () => {
+    syncDims();  // make sure latest values are in the hidden frames/width/height inputs
     const btn = document.getElementById('gen-btn');
     if (btn) { btn.classList.add('loading'); btn.disabled = true; }
   });
@@ -1943,102 +2090,430 @@ INDEX_HTML = r"""<!doctype html>
 """
 
 VIEW_HTML = r"""<!doctype html>
-<html><head>
-<meta charset="utf-8"><title>job {{ job_id }}</title>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>generating · {{ job_id }}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
-  :root { color-scheme: dark; }
-  body { font: 15px/1.45 system-ui, sans-serif; background: #0c0f14; color: #e6e8ec;
-         margin: 0; padding: 32px; max-width: 900px; }
-  h1 { font-size: 20px; margin: 0 0 18px; }
-  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px;
-          background: #1f2630; color: #aab1bf; font-size: 12px; margin-left: 8px;
-          vertical-align: middle; }
-  .pill.done { background: #163b1f; color: #7be38c; }
-  .pill.error { background: #3b1616; color: #ff8585; }
-  .progress { height: 10px; background: #161a23; border-radius: 5px; overflow: hidden;
-              margin: 14px 0; }
-  .progress > div { height: 100%; background: #6aa6ff;
-                    transition: width .25s; width: 0%; }
-  .msg { color: #aab1bf; min-height: 20px; }
-  .err { color: #ff8585; }
-  video { width: 100%; margin-top: 20px; border-radius: 8px; background: #000; }
-  .actions { display: flex; gap: 10px; margin-top: 16px; }
-  .actions a, .actions button { padding: 9px 14px; background: #6aa6ff;
-                                color: #0c0f14; border: 0; border-radius: 6px;
-                                font-weight: 600; cursor: pointer;
-                                text-decoration: none; }
-  .actions .ghost { background: #1f2630; color: #e6e8ec; }
-  details { margin-top: 20px; }
-  summary { cursor: pointer; color: #aab1bf; }
-  textarea, input[type=text], input[type=number] {
-    width: 100%; padding: 9px 11px; background: #161a23; color: #e6e8ec;
-    border: 1px solid #2a2f3a; border-radius: 6px; font: inherit;
-    margin-top: 6px;
-  }
-  .checkbox { display: flex; gap: 6px; align-items: center; margin: 10px 0; }
-  .checkbox input { width: auto; }
+  :root { color-scheme: dark;
+    --bg-0:#05060c; --bg-1:#0c0f1c;
+    --ink-0:#f6f8fc; --ink-1:#c5cce0; --ink-2:#8c95b0; --ink-3:#5b657d;
+    --accent-1:#7a5cff; --accent-2:#3aa1ff; --accent-3:#ff5cb1;
+    --good:#52d6a3; --err:#ff5c87;
+    --line:rgba(255,255,255,.07);
+    --panel:rgba(20,26,42,.6); --shadow-card:0 30px 80px rgba(0,0,0,.45);
+    --grad-accent:linear-gradient(135deg,#7a5cff 0%,#3aa1ff 50%,#ff5cb1 100%);
+    --grad-text:linear-gradient(135deg,#fff 0%,#c5cce0 50%,#7a5cff 100%); }
+  *,*::before,*::after { box-sizing:border-box; }
+  html,body { margin:0; padding:0; }
+  body { font-family:"Inter",ui-sans-serif,system-ui,sans-serif; color:var(--ink-0);
+         background:var(--bg-0); min-height:100vh; -webkit-font-smoothing:antialiased; }
+  /* aurora */
+  .aurora { position:fixed; inset:0; z-index:-2; overflow:hidden; background:var(--bg-0); }
+  .aurora::before,.aurora::after,.aurora .blob {
+    content:""; position:absolute; border-radius:50%; filter:blur(80px); opacity:.5; will-change:transform; }
+  .aurora::before { width:600px;height:600px;left:-150px;top:-150px;
+    background:radial-gradient(circle,var(--accent-1),transparent 60%);
+    animation:float1 24s ease-in-out infinite; }
+  .aurora::after { width:700px;height:700px;right:-200px;top:5%;
+    background:radial-gradient(circle,var(--accent-2),transparent 60%);
+    animation:float2 30s ease-in-out infinite; }
+  .aurora .blob { width:550px;height:550px;left:30%;bottom:-200px;
+    background:radial-gradient(circle,var(--accent-3),transparent 60%);
+    animation:float3 36s ease-in-out infinite; }
+  @keyframes float1 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(140px,80px) scale(1.1)} }
+  @keyframes float2 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(-120px,140px) scale(1.05)} }
+  @keyframes float3 { 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(80px,-100px) scale(1.15)} }
+  .grain { position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:.15;
+    mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9'/></filter><rect width='200' height='200' filter='url(%23n)' opacity='.5'/></svg>"); }
+
+  /* header */
+  header.top { position:sticky; top:0; z-index:10; padding:1rem 1.5rem;
+    display:flex; align-items:center; justify-content:space-between;
+    border-bottom:1px solid var(--line); backdrop-filter:blur(14px);
+    background:rgba(5,6,12,0.65); }
+  .brand { display:flex; align-items:center; gap:.6rem; font-weight:700;
+           text-decoration:none; color:var(--ink-0); }
+  .brand .dot { width:10px; height:10px; border-radius:50%;
+    background:linear-gradient(135deg,var(--accent-1),var(--accent-3));
+    box-shadow:0 0 18px var(--accent-1); }
+  .top a { color:var(--ink-1); text-decoration:none; font-size:.9rem; }
+  .top a:hover { color:var(--accent-2); }
+  .jobid { font-family:"JetBrains Mono",ui-monospace,monospace; font-size:.85rem;
+           color:var(--ink-2); letter-spacing:.05em; }
+
+  main { max-width:920px; margin:0 auto; padding:3rem 1.5rem 5rem; }
+
+  /* Stage / video container */
+  .stage { width:100%; aspect-ratio:9/14; max-height:600px; background:#000;
+    border-radius:24px; overflow:hidden; position:relative;
+    box-shadow:var(--shadow-card); border:1px solid var(--line); }
+  .stage video { width:100%; height:100%; object-fit:contain; display:none; background:#000; }
+  .stage video.live { display:block; }
+
+  /* In-progress overlay */
+  .prep { position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; padding:2rem; text-align:center;
+    background:radial-gradient(800px 500px at 50% 30%,rgba(122,92,255,0.18) 0%,transparent 60%); }
+  .ring { width:92px; height:92px; margin-bottom:1.4rem; position:relative; }
+  .ring::before,.ring::after { content:""; position:absolute; inset:0; border-radius:50%;
+    border:3px solid transparent; }
+  .ring::before { border-top-color:var(--accent-1);
+    animation:spin 1.1s cubic-bezier(.5,.05,.95,.5) infinite; }
+  .ring::after { border-top-color:var(--accent-2); inset:12px;
+    animation:spin 1.6s cubic-bezier(.5,.05,.95,.5) infinite reverse; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  .phase-name { font-size:1.5rem; font-weight:700; letter-spacing:-.02em;
+    background:var(--grad-text); -webkit-background-clip:text; background-clip:text;
+    color:transparent; margin-bottom:.6rem; }
+  .phase-msg { color:var(--ink-1); font-size:.95rem; margin-top:.2rem;
+    max-width:520px; line-height:1.55; }
+  .phase-msg.err { color:var(--err); }
+  .elapsed { font-family:"JetBrains Mono",ui-monospace,monospace; font-size:.8rem;
+    color:var(--ink-3); margin-top:1.2rem; letter-spacing:.06em; }
+
+  /* Phase step pills */
+  .steps { margin-top:1.6rem; display:flex; gap:.4rem; justify-content:center; flex-wrap:wrap; }
+  .step { padding:.35rem .8rem; border-radius:999px;
+    background:rgba(255,255,255,.04); color:var(--ink-2); font-size:.72rem;
+    border:1px solid transparent; font-family:"JetBrains Mono",ui-monospace,monospace;
+    transition:all .2s; letter-spacing:.04em; }
+  .step.done { color:var(--good); border-color:rgba(82,214,163,.3);
+    background:rgba(82,214,163,.08); }
+  .step.active { color:var(--ink-0); border-color:var(--accent-1);
+    background:rgba(122,92,255,.15); box-shadow:0 0 24px rgba(122,92,255,.25); }
+
+  /* Progress bar */
+  .progress-wrap { width:100%; padding:1.6rem 1.4rem 0; }
+  .progress { width:100%; height:6px; background:rgba(255,255,255,.06);
+    border-radius:3px; overflow:hidden; }
+  .progress > div { height:100%; background:var(--grad-accent); width:0;
+    transition:width .3s; border-radius:3px;
+    box-shadow:0 0 12px rgba(122,92,255,.5); }
+  .progress-meta { display:flex; justify-content:space-between; margin-top:.5rem;
+    color:var(--ink-3); font-size:.78rem;
+    font-family:"JetBrains Mono",ui-monospace,monospace; }
+
+  /* Done state */
+  #player-wrap { display:none; }
+  #player-wrap.show { display:block; }
+  .actions { display:flex; gap:.7rem; margin-top:1.4rem; flex-wrap:wrap; }
+  .btn { padding:.7rem 1.4rem; background:var(--grad-accent); color:#0a0e1a;
+    border:0; border-radius:10px; font:600 .9rem inherit; cursor:pointer;
+    text-decoration:none; display:inline-flex; align-items:center; gap:.5rem;
+    transition:all .15s;
+    box-shadow:0 8px 24px -8px rgba(122,92,255,.45); }
+  .btn:hover { transform:translateY(-1px);
+    box-shadow:0 12px 32px -8px rgba(122,92,255,.6); }
+  .btn.ghost { background:transparent; color:var(--ink-1);
+    border:1px solid var(--line); box-shadow:none; }
+  .btn.ghost:hover { color:var(--ink-0); border-color:var(--accent-1);
+    background:rgba(122,92,255,.04); }
+
+  details { margin-top:1.8rem; }
+  summary { cursor:pointer; color:var(--ink-1); padding:.7rem 1rem;
+    border:1px solid var(--line); border-radius:10px; font-size:.85rem;
+    user-select:none; list-style:none; }
+  summary::-webkit-details-marker { display:none; }
+  summary:hover { color:var(--ink-0); border-color:var(--accent-1); }
+  .panel { background:var(--panel); border:1px solid var(--line);
+    border-radius:14px; padding:1.4rem; margin-top:.7rem;
+    backdrop-filter:blur(10px); }
+  .panel label { display:block; margin:.7rem 0 .3rem; color:var(--ink-2); font-size:.8rem; }
+  .panel label:first-child { margin-top:0; }
+  textarea, .panel input[type=number] {
+    width:100%; padding:.7rem .9rem; background:rgba(7,10,18,.5); color:var(--ink-0);
+    border:1px solid var(--line); border-radius:8px; font:14px/1.5 inherit;
+    font-family:inherit; }
+  textarea:focus, input:focus { outline:none; border-color:var(--accent-1); }
+  textarea { min-height:80px; resize:vertical; }
+  .row { display:flex; gap:.7rem; flex-wrap:wrap; }
+  .row > * { flex:1; min-width:120px; }
+  .ck { display:flex; gap:.5rem; align-items:center; margin:.7rem 0; }
+  .ck input { width:auto; accent-color:var(--accent-1); }
+  .ck label { margin:0; cursor:pointer; }
+
+  /* Prompt details box */
+  .prompts p { color:var(--ink-1); font-size:.85rem; line-height:1.5;
+    margin:.6rem 0; }
+  .prompts b { color:var(--accent-2); font-weight:500; margin-right:.4rem; }
 </style>
 </head><body>
-<h1>Job <code id="jid">{{ job_id }}</code><span class="pill" id="phase">queued</span></h1>
-<div class="progress"><div id="bar"></div></div>
-<div class="msg" id="msg"></div>
-<div class="err" id="err"></div>
-<div id="player-wrap" style="display:none">
-  <video id="player" controls playsinline></video>
-  <div class="actions">
-    <a id="dl" href="">Download MP4</a>
-    <a class="ghost" href="/">New job</a>
-  </div>
-  <details>
-    <summary>Extend this video</summary>
-    <form method="post" id="ext-form">
-      <label>Continuation prompt</label>
-      <textarea name="prompt" placeholder="The next scene continues with the same motion and lighting…"></textarea>
-      <label>Frames</label><input name="frames" type="number" value="97">
-      <label>Steps</label><input name="steps" type="number" value="30">
-      <div class="checkbox">
-        <input type="checkbox" id="enh-ext" name="enhance" value="1" checked>
-        <label for="enh-ext" style="margin:0">Enhance continuation with Qwen</label>
+<div class="aurora"><div class="blob"></div></div>
+<div class="grain"></div>
+
+<header class="top">
+  <a href="/" class="brand"><span class="dot"></span> image2video</a>
+  <span class="jobid">{{ job_id }}</span>
+</header>
+
+<main>
+  <div class="stage" id="stage">
+    <video id="player" controls playsinline></video>
+    <div class="prep" id="prep">
+      <div class="ring"></div>
+      <div class="phase-name" id="phase-name">Queued</div>
+      <div class="phase-msg" id="phase-msg">Waiting for an available worker…</div>
+      <div class="steps" id="steps">
+        <span class="step" data-phase="queued">queued</span>
+        <span class="step" data-phase="enhancing">enhance prompt</span>
+        <span class="step" data-phase="loading_models">load models</span>
+        <span class="step" data-phase="encoding_text">encode text</span>
+        <span class="step" data-phase="sampling">sample</span>
+        <span class="step" data-phase="decoding">decode</span>
+        <span class="step" data-phase="muxing">mux audio</span>
+        <span class="step" data-phase="done">done</span>
       </div>
-      <div class="actions"><button type="submit">Extend</button></div>
-    </form>
+      <div class="elapsed" id="elapsed">0:00 elapsed</div>
+    </div>
+  </div>
+
+  <div class="progress-wrap">
+    <div class="progress"><div id="bar"></div></div>
+    <div class="progress-meta">
+      <span id="pct-label">0%</span>
+      <span id="step-label">step 0 / 0</span>
+    </div>
+  </div>
+
+  <details id="log-details" open style="margin-top:1.4rem;">
+    <summary style="display:flex;justify-content:space-between;align-items:center;">
+      <span>Live log — what ComfyUI is doing right now</span>
+      <span class="ck" style="margin:0;gap:.4rem;" onclick="event.stopPropagation()">
+        <input type="checkbox" id="log-on" checked
+               onchange="event.stopPropagation();toggleLogs(this.checked)">
+        <label for="log-on" style="font-size:.78rem;color:var(--ink-2);
+          font-family:'JetBrains Mono',ui-monospace,monospace;">stream</label>
+      </span>
+    </summary>
+    <div class="panel" style="padding:0;background:rgba(0,0,0,.45);">
+      <pre id="loglines" style="margin:0;padding:1rem;max-height:260px;overflow:auto;
+            font:12px/1.55 'JetBrains Mono',ui-monospace,monospace;color:var(--ink-1);
+            white-space:pre-wrap;word-break:break-word;"></pre>
+    </div>
   </details>
-  <details>
-    <summary>Prompt details</summary>
-    <p><b>Original:</b> <span id="p-orig"></span></p>
-    <p><b>Enhanced:</b> <span id="p-enh"></span></p>
+
+  <details id="art-details" open style="margin-top:.7rem;">
+    <summary>Generated artifacts — frames + probes as they appear</summary>
+    <div class="panel" style="padding:.8rem;">
+      <div id="art-grid" style="display:grid;gap:.5rem;
+            grid-template-columns:repeat(auto-fill,minmax(120px,1fr));
+            max-height:260px;overflow-y:auto;">
+        <div style="grid-column:1/-1;color:var(--ink-3);font-size:.8rem;text-align:center;padding:1rem;">
+          Waiting for first artifact…
+        </div>
+      </div>
+    </div>
   </details>
-</div>
+
+  <div id="player-wrap">
+    <div class="actions">
+      <a class="btn" id="dl" href="" download>↓ Download MP4</a>
+      <a class="btn ghost" href="/">+ New generation</a>
+    </div>
+
+    <details open>
+      <summary>Extend this video — continue from the last frame</summary>
+      <div class="panel">
+        <form method="post" id="ext-form">
+          <label>What happens next?</label>
+          <textarea name="prompt" placeholder="The next scene continues with the same motion and lighting…"></textarea>
+          <div class="row">
+            <div><label>Duration (sec)</label><input name="duration" type="number" value="2" min="1" max="10" id="ext-dur"></div>
+            <div><label>Frames (auto)</label><input name="frames" type="number" value="49" id="ext-frames" readonly></div>
+            <div><label>Steps</label><input name="steps" type="number" value="13"></div>
+          </div>
+          <div class="ck">
+            <input type="checkbox" id="enh-ext" name="enhance" value="1" checked>
+            <label for="enh-ext">Enhance continuation with Qwen</label>
+          </div>
+          <div class="actions"><button class="btn" type="submit">Extend ↪</button></div>
+        </form>
+      </div>
+    </details>
+
+    <details>
+      <summary>Prompt details</summary>
+      <div class="panel prompts">
+        <p><b>Original:</b> <span id="p-orig"></span></p>
+        <p><b>Enhanced:</b> <span id="p-enh"></span></p>
+      </div>
+    </details>
+  </div>
+</main>
 
 <script>
   const JOB = "{{ job_id }}";
   const $ = id => document.getElementById(id);
   $('ext-form').action = `/extend/${JOB}`;
 
+  // Auto-update Extend's frames from duration (24 fps -> multiples of 8 + 1)
+  const extDur = $('ext-dur'), extFrames = $('ext-frames');
+  function syncExtFrames() {
+    const sec = Math.max(1, parseInt(extDur.value || '2', 10));
+    // Vantage MathExpression: frames = ceil((ceil(s)*24)/8)*8 + 1
+    extFrames.value = Math.ceil((Math.ceil(sec) * 24) / 8) * 8 + 1;
+  }
+  if (extDur) { extDur.addEventListener('input', syncExtFrames); syncExtFrames(); }
+
+  // Human-friendly phase names + descriptions
+  const PHASE_INFO = {
+    queued:          { name: 'Queued',           msg: 'Waiting for an available worker…' },
+    enhancing:       { name: 'Enhancing prompt', msg: 'Qwen is polishing your prompt into a richer description…' },
+    loading_models:  { name: 'Loading models',   msg: 'Pulling UNET + text encoders + VAE into VRAM (~30 s)…' },
+    encoding_text:   { name: 'Encoding prompt',  msg: 'Running Gemma + LTX text encoders on your prompt…' },
+    encoding_image:  { name: 'Encoding image',   msg: 'VAE-encoding your source image into the video latent…' },
+    sampling:        { name: 'Sampling',         msg: 'Denoising the video latent through the diffusion sampler…' },
+    upscaling:       { name: 'Upscaling',        msg: 'Latent 2× spatial upscale before refinement pass…' },
+    decoding:        { name: 'Decoding',         msg: 'VAE-decoding the latent into pixel frames…' },
+    muxing:          { name: 'Muxing audio',     msg: 'Combining frames + audio into the final MP4…' },
+    done:            { name: 'Done',             msg: 'Your clip is ready below.' },
+    error:           { name: 'Error',            msg: 'Something went wrong.' },
+  };
+
+  const t0 = Date.now();
+  function fmtElapsed(s) {
+    const m = Math.floor(s / 60); const r = s % 60;
+    return `${m}:${String(r).padStart(2,'0')} elapsed`;
+  }
+
+  let pollMs = 1200;
   async function tick() {
     let r;
     try { r = await fetch(`/job/${JOB}/status`).then(r => r.json()); }
-    catch (e) { setTimeout(tick, 1500); return; }
-    $('phase').textContent = r.phase;
-    $('phase').className = 'pill' + (r.phase === 'done' ? ' done' :
-                                     r.phase === 'error' ? ' error' : '');
-    $('msg').textContent = r.message || '';
-    $('err').textContent = r.error || '';
+    catch (e) { setTimeout(tick, pollMs); return; }
+
+    const ph = r.phase || 'queued';
+    const info = PHASE_INFO[ph] || { name: ph, msg: r.message || '' };
+    $('phase-name').textContent = info.name;
+    $('phase-msg').textContent = r.message || info.msg;
+    $('phase-msg').classList.toggle('err', ph === 'error');
+
+    // Step pills: mark done up to current, active is current
+    const order = Object.keys(PHASE_INFO).filter(k => k !== 'error');
+    const curIdx = order.indexOf(ph);
+    document.querySelectorAll('.step').forEach(s => {
+      const idx = order.indexOf(s.dataset.phase);
+      s.classList.remove('active', 'done');
+      if (idx >= 0 && curIdx >= 0) {
+        if (idx < curIdx) s.classList.add('done');
+        else if (idx === curIdx) s.classList.add('active');
+      }
+    });
+
     const pct = Math.round((r.progress || 0) * 100);
     $('bar').style.width = pct + '%';
-    if (r.phase === 'done' && r.has_output) {
+    $('pct-label').textContent = pct + '%';
+    if (r.total_steps) {
+      $('step-label').textContent =
+        `step ${r.current_step || 0} / ${r.total_steps}`;
+    } else {
+      $('step-label').textContent = '';
+    }
+    $('elapsed').textContent = fmtElapsed(Math.floor((Date.now() - t0) / 1000));
+
+    if (ph === 'done' && r.has_output) {
       const v = $('player');
       if (!v.src) v.src = `/job/${JOB}/output`;
+      v.classList.add('live');
+      $('prep').style.display = 'none';
       $('dl').href = `/job/${JOB}/download`;
-      $('player-wrap').style.display = 'block';
-      $('p-orig').textContent = r.prompt || '';
+      $('player-wrap').classList.add('show');
+      $('p-orig').textContent = r.prompt || '(empty)';
       $('p-enh').textContent = r.enhanced_prompt || '(not enhanced)';
-      return;  // stop polling once done
+      return;  // stop polling
     }
-    if (r.phase === 'error') return;
-    setTimeout(tick, 1500);
+    if (ph === 'error') {
+      $('phase-msg').textContent = r.error || r.message || 'Generation failed.';
+      // keep the spinner spinning but in red mood; user can read the error
+      return;
+    }
+    // Adaptive poll — slow down when sampling (long-running phase)
+    pollMs = (ph === 'sampling' || ph === 'upscaling') ? 2500 : 1200;
+    setTimeout(tick, pollMs);
   }
+
+  // ============ Live log tail (toggleable) ============
+  const logEl = $('loglines');
+  let lastLogJoin = '';
+  let logsOn = (localStorage.getItem('logsOn') !== '0');  // default ON
+  $('log-on').checked = logsOn;
+  function toggleLogs(on) {
+    logsOn = on;
+    localStorage.setItem('logsOn', on ? '1' : '0');
+    if (!on) logEl.innerHTML = '<span style="color:var(--ink-3)">' +
+      'log streaming paused — toggle the checkbox above to re-enable</span>';
+  }
+  window.toggleLogs = toggleLogs;
+  async function tickLogs() {
+    if (!logsOn) { setTimeout(tickLogs, 2000); return; }
+    try {
+      const r = await fetch(`/job/${JOB}/logs.json`).then(r => r.json());
+      const lines = (r.lines || []).map(ln => {
+        if (/error|RuntimeError|OOM|out of memory/i.test(ln))
+          return `<span style="color:var(--err)">${ln}</span>`;
+        if (/\d+\/\d+ \[\d+:\d+&lt;\d+:\d+/.test(ln) || /sampler|sampling/i.test(ln))
+          return `<span style="color:var(--accent-2)">${ln}</span>`;
+        if (/INFO|loaded|warmup/i.test(ln))
+          return `<span style="color:var(--ink-2)">${ln}</span>`;
+        return ln;
+      }).join('\n');
+      if (lines !== lastLogJoin) {
+        const wasAtBottom = (logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 20);
+        logEl.innerHTML = lines;
+        if (wasAtBottom) logEl.scrollTop = logEl.scrollHeight;
+        lastLogJoin = lines;
+      }
+    } catch (e) { /* ignore */ }
+    setTimeout(tickLogs, 2000);
+  }
+
+  // ============ Artifact gallery (frames/probes as they appear) ============
+  const artEl = $('art-grid');
+  let lastArtKey = '';
+  async function tickArtifacts() {
+    try {
+      const r = await fetch(`/job/${JOB}/artifacts.json`).then(r => r.json());
+      const items = r.items || [];
+      const key = items.map(it => it.name + ':' + it.mtime).join('|');
+      if (key !== lastArtKey) {
+        if (!items.length) {
+          artEl.innerHTML = '<div style="grid-column:1/-1;color:var(--ink-3);' +
+            'font-size:.8rem;text-align:center;padding:1rem;">Waiting for first artifact…</div>';
+        } else {
+          artEl.innerHTML = items.map(it => {
+            const t = new Date(it.mtime * 1000).toLocaleTimeString();
+            return `<a href="${it.url}" target="_blank"
+              style="display:block;border:1px solid var(--line);border-radius:8px;
+                     overflow:hidden;background:#000;text-decoration:none;
+                     transition:transform .15s;"
+              onmouseover="this.style.transform='translateY(-2px) scale(1.02)';
+                           this.style.borderColor='var(--accent-1)';"
+              onmouseout="this.style.transform='none';
+                          this.style.borderColor='var(--line)';">
+              <img src="${it.url}" style="width:100%;display:block;aspect-ratio:3/4;object-fit:cover;">
+              <div style="padding:4px 6px;background:rgba(0,0,0,.5);">
+                <div style="font:9px 'JetBrains Mono',monospace;color:var(--ink-2);
+                            overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                  ${it.name}</div>
+                <div style="font:9px 'JetBrains Mono',monospace;color:var(--ink-3);">${t}</div>
+              </div></a>`;
+          }).join('');
+        }
+        lastArtKey = key;
+      }
+    } catch (e) { /* ignore */ }
+    setTimeout(tickArtifacts, 3000);
+  }
+
   tick();
+  tickLogs();
+  tickArtifacts();
 </script>
 </body></html>
 """
