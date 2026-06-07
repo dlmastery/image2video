@@ -1107,8 +1107,9 @@ def _run_job(job: Job) -> None:
         if not COMFY.is_alive():
             COMFY.start()
         prompt_id = COMFY.submit(patched)
-        _set(job, phase="generating",
-             message=f"Sampling {job.frames} frames on Sulphur-2…",
+        _set(job, phase="sampling",
+             message=f"Sampling {job.frames} frames "
+                     f"({job.steps} stage-1 steps + 3 stage-2 refinement)…",
              total_steps=job.steps)
 
         # Run WS listener in this thread; it returns when done/error
@@ -2365,12 +2366,15 @@ VIEW_HTML = r"""<!doctype html>
   const PHASE_INFO = {
     queued:          { name: 'Queued',           msg: 'Waiting for an available worker…' },
     enhancing:       { name: 'Enhancing prompt', msg: 'Qwen is polishing your prompt into a richer description…' },
+    submitting:      { name: 'Submitting',       msg: 'Sending the workflow graph to ComfyUI…' },
     loading_models:  { name: 'Loading models',   msg: 'Pulling UNET + text encoders + VAE into VRAM (~30 s)…' },
-    encoding_text:   { name: 'Encoding prompt',  msg: 'Running Gemma + LTX text encoders on your prompt…' },
+    encoding_text:   { name: 'Encoding prompt',  msg: 'Running text encoders on your prompt…' },
     encoding_image:  { name: 'Encoding image',   msg: 'VAE-encoding your source image into the video latent…' },
     sampling:        { name: 'Sampling',         msg: 'Denoising the video latent through the diffusion sampler…' },
+    generating:      { name: 'Generating',       msg: 'Denoising the video latent through the diffusion sampler…' },
     upscaling:       { name: 'Upscaling',        msg: 'Latent 2× spatial upscale before refinement pass…' },
     decoding:        { name: 'Decoding',         msg: 'VAE-decoding the latent into pixel frames…' },
+    encoding:        { name: 'Saving MP4',       msg: 'Combining frames + audio into the final MP4…' },
     muxing:          { name: 'Muxing audio',     msg: 'Combining frames + audio into the final MP4…' },
     done:            { name: 'Done',             msg: 'Your clip is ready below.' },
     error:           { name: 'Error',            msg: 'Something went wrong.' },
