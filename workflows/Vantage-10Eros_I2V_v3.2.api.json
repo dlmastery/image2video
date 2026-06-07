@@ -11,16 +11,18 @@
       "any_01": [
         "836",
         0
-      ],
-      "any_02": [
-        "839",
-        0
       ]
     }
   },
   "557": {
     "class_type": "Power Lora Loader (rgthree)",
     "inputs": {
+      "lora_1": {
+        "on": true,
+        "lora": "OmniNFT_converted_lora.safetensors",
+        "strength": 0.8,
+        "strengthTwo": null
+      },
       "model": [
         "841",
         0
@@ -52,12 +54,8 @@
   "532": {
     "class_type": "ResizeImageMaskNode",
     "inputs": {
-      "resize_type": {
-        "key": "scale by multiplier",
-        "inputs": {
-          "multiplier": 0.5
-        }
-      },
+      "resize_type": "scale by multiplier",
+      "resize_type.multiplier": 0.5,
       "scale_method": "area",
       "input": [
         "531",
@@ -116,12 +114,8 @@
   "770": {
     "class_type": "LTXVImgToVideoInplaceKJ",
     "inputs": {
-      "num_images": {
-        "key": "1",
-        "inputs": {
-          "strength_1": 1
-        }
-      },
+      "num_images": "1",
+      "num_images.strength_1": 1,
       "vae": [
         "842",
         0
@@ -237,12 +231,8 @@
   "772": {
     "class_type": "LTXVImgToVideoInplaceKJ",
     "inputs": {
-      "num_images": {
-        "key": "1",
-        "inputs": {
-          "strength_1": 0.77
-        }
-      },
+      "num_images": "1",
+      "num_images.strength_1": 0.77,
       "vae": [
         "842",
         0

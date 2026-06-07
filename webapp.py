@@ -763,24 +763,25 @@ class ComfyClient:
             if sys.platform == "win32":
                 # CREATE_NEW_PROCESS_GROUP so taskkill /T can find the tree
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-            # 16 GB VRAM tuning per the LTX-10Eros Vantage tutorial:
-            #  --force-fp16  keeps sampling activations at FP16 (vs FP32
-            #                default), important alongside GGUF Q3/Q4
-            #                UNET weights so attention buffers fit.
-            #  --lowvram     aggressively offloads models to CPU between
-            #                ops. Required because the canonical
-            #                gemma_3_12B_it.safetensors text encoder is
-            #                22.7 GB and the Q3_K_M UNET is 11 GB; sum
-            #                exceeds the 16 GB VRAM card, so they have
-            #                to swap on-demand.
+            # 16 GB VRAM tuning: NO --lowvram, NO --force-fp16.
+            # Tried --lowvram + --force-fp16 during 10Eros debugging — sampler
+            # ran at 5+ min/step because lowvram forced UNET swap on every
+            # step. With text encoder auto-offloaded to CPU (~22 GB regular
+            # RAM), the Q3_K_M UNET (10.4 GB) + VAE (1.4 GB) fits in 16 GB
+            # cleanly and stays resident → ~5–20 s/step.
+            # expandable_segments allocator prevents VRAM fragmentation
+            # across the dual-stage sampler (matches the working Lightning
+            # AI Colab reference for LTX-2.3).
+            env = os.environ.copy()
+            env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
             self.proc = subprocess.Popen(
                 [sys.executable, str(COMFY_DIR / "main.py"),
-                 "--listen", COMFY_HOST, "--port", str(COMFY_PORT),
-                 "--force-fp16", "--lowvram"],
+                 "--listen", COMFY_HOST, "--port", str(COMFY_PORT)],
                 cwd=str(COMFY_DIR),
                 stdout=open(log_path, "wb"),
                 stderr=open(err_path, "wb"),
                 creationflags=creationflags,
+                env=env,
             )
         # Wait for ready
         deadline = time.time() + 180
@@ -1150,6 +1151,24 @@ app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024  # 256 MB
 def index():
     return render_template_string(INDEX_HTML)
 
+@app.get("/jobs.json")
+def jobs_json():
+    """Recent completed jobs for the homepage gallery."""
+    items = []
+    for jid, j in JOBS.items():
+        if j.phase != "done":
+            continue
+        items.append({
+            "id": jid,
+            "mode": j.mode,
+            "prompt": (j.prompt or "")[:80],
+            "thumb": f"/job/{jid}/output",     # served as <video poster> source
+            "url": f"/job/{jid}",
+        })
+    items.sort(key=lambda x: x["id"], reverse=True)
+    from flask import jsonify
+    return jsonify(items[:12])
+
 @app.get("/job/<job_id>")
 def view_job(job_id):
     if job_id not in JOBS:
@@ -1300,97 +1319,625 @@ def comfy_healthz():
 # HTML templates (inline, faceswap-style)
 # ===========================================================================
 INDEX_HTML = r"""<!doctype html>
-<html><head>
-<meta charset="utf-8"><title>image2video</title>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>image2video — bring stills to life</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
-  :root { color-scheme: dark; }
-  body { font: 15px/1.45 system-ui, sans-serif; background: #0c0f14; color: #e6e8ec;
-         margin: 0; padding: 32px; }
-  h1 { font-size: 24px; margin: 0 0 24px; }
-  .tabs { display: flex; gap: 4px; border-bottom: 1px solid #2a2f3a; margin-bottom: 24px; }
-  .tab { padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent; }
-  .tab.active { border-bottom-color: #6aa6ff; color: #fff; }
-  .panel { display: none; max-width: 720px; }
-  .panel.active { display: block; }
-  label { display: block; margin: 12px 0 4px; color: #aab1bf; font-size: 13px; }
-  textarea, input[type=text], input[type=number], input[type=file] {
-    width: 100%; padding: 9px 11px; background: #161a23; color: #e6e8ec;
-    border: 1px solid #2a2f3a; border-radius: 6px; font: inherit;
+  :root { color-scheme: dark;
+    --bg-0:#05060c; --bg-1:#0c0f1c; --bg-2:#13182a;
+    --ink-0:#f6f8fc; --ink-1:#c5cce0; --ink-2:#8c95b0; --ink-3:#5b657d;
+    --accent-1:#7a5cff; --accent-2:#3aa1ff; --accent-3:#ff5cb1;
+    --good:#52d6a3; --warn:#fbbf24;
+    --line:rgba(255,255,255,.07); --line-hot:rgba(122,92,255,.4);
+    --panel:rgba(20,26,42,.6); --panel-solid:#13182a;
+    --shadow-card: 0 30px 80px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06);
+    --shadow-glow: 0 0 40px rgba(122,92,255,.35);
+    --grad-accent: linear-gradient(135deg, #7a5cff 0%, #3aa1ff 50%, #ff5cb1 100%);
+    --grad-text: linear-gradient(135deg, #fff 0%, #c5cce0 50%, #7a5cff 100%);
   }
-  textarea { min-height: 90px; resize: vertical; }
-  .row { display: flex; gap: 12px; }
-  .row > * { flex: 1; }
-  button { padding: 10px 18px; background: #6aa6ff; color: #0c0f14;
-           border: 0; border-radius: 6px; font-weight: 600; cursor: pointer;
-           margin-top: 18px; }
-  button:hover { background: #82b6ff; }
-  .checkbox { display: flex; gap: 6px; align-items: center; margin: 12px 0; }
-  .checkbox input { width: auto; }
-  .hint { color: #6b7280; font-size: 12px; margin-top: 4px; }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body { font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         color: var(--ink-0); background: var(--bg-0); min-height: 100vh;
+         overflow-x: hidden; -webkit-font-smoothing: antialiased; }
+  /* ============ Aurora animated background ============ */
+  .aurora { position: fixed; inset: 0; z-index: -2; overflow: hidden; background: var(--bg-0); }
+  .aurora::before, .aurora::after, .aurora .blob {
+    content: ""; position: absolute; border-radius: 50%; filter: blur(80px);
+    opacity: 0.55; will-change: transform; }
+  .aurora::before {
+    width: 600px; height: 600px; left: -150px; top: -150px;
+    background: radial-gradient(circle, var(--accent-1), transparent 60%);
+    animation: float1 24s ease-in-out infinite; }
+  .aurora::after {
+    width: 700px; height: 700px; right: -200px; top: 5%;
+    background: radial-gradient(circle, var(--accent-2), transparent 60%);
+    animation: float2 30s ease-in-out infinite; }
+  .aurora .blob {
+    width: 550px; height: 550px; left: 30%; bottom: -200px;
+    background: radial-gradient(circle, var(--accent-3), transparent 60%);
+    animation: float3 36s ease-in-out infinite; }
+  @keyframes float1 { 0%,100% { transform: translate(0,0) scale(1); }
+                      50% { transform: translate(140px,80px) scale(1.1); } }
+  @keyframes float2 { 0%,100% { transform: translate(0,0) scale(1); }
+                      50% { transform: translate(-120px,140px) scale(1.05); } }
+  @keyframes float3 { 0%,100% { transform: translate(0,0) scale(1); }
+                      50% { transform: translate(80px,-100px) scale(1.15); } }
+  /* film-grain overlay */
+  .grain { position: fixed; inset: 0; z-index: -1; pointer-events: none;
+           opacity: 0.15; mix-blend-mode: overlay;
+           background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9'/></filter><rect width='200' height='200' filter='url(%23n)' opacity='.5'/></svg>"); }
+  /* ============ Spinners ============ */
+  .ring { width: 18px; height: 18px; position: relative; display: inline-block; }
+  .ring::before, .ring::after {
+    content: ""; position: absolute; inset: 0; border-radius: 50%;
+    border: 2px solid transparent; }
+  .ring::before { border-top-color: var(--accent-1);
+    animation: spin 1.1s cubic-bezier(.5,.05,.95,.5) infinite; }
+  .ring::after { border-top-color: var(--accent-2); inset: 4px;
+    animation: spin 1.6s cubic-bezier(.5,.05,.95,.5) infinite reverse; }
+  .ring-lg { width: 64px; height: 64px; }
+  .ring-lg::after { inset: 8px; border-width: 3px; }
+  .ring-lg::before { border-width: 3px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* Pulse-glow for active dots */
+  @keyframes pulse-glow {
+    0%,100% { box-shadow: 0 0 12px rgba(122,92,255,.4); }
+    50%     { box-shadow: 0 0 24px rgba(122,92,255,.85); }
+  }
+  @keyframes blink { 50% { opacity: 0.35; } }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 28px 80px; position: relative; }
+  /* ============ Hero / Header ============ */
+  .top { display: flex; align-items: center; justify-content: space-between;
+         margin-bottom: 56px; }
+  .logo { display: flex; align-items: center; gap: 12px; font-weight: 700;
+          font-size: 17px; letter-spacing: -0.3px; }
+  .logo .mark { width: 32px; height: 32px; border-radius: 9px;
+                background: var(--grad-accent);
+                display: grid; place-items: center;
+                box-shadow: var(--shadow-glow); }
+  .logo .mark::after { content: '▷'; color: rgba(7,10,18,0.85); font-size: 14px;
+                       margin-left: 2px; transform: translateY(0px); }
+  .nav-r { display: flex; gap: 24px; align-items: center; }
+  .nav-r a { color: var(--ink-1); text-decoration: none; font-size: 14px;
+             transition: color 0.15s; }
+  .nav-r a:hover { color: var(--ink-0); }
+  .hero { text-align: center; max-width: 760px; margin: 0 auto 48px; }
+  .hero .pill { display: inline-flex; gap: 8px; align-items: center;
+                padding: 6px 14px; border: 1px solid var(--line);
+                border-radius: 999px; font-size: 12px; color: var(--ink-1);
+                margin-bottom: 22px;
+                background: rgba(22,27,42,0.4); backdrop-filter: blur(8px); }
+  .hero .pill .dot { width: 6px; height: 6px; border-radius: 50%;
+                     background: var(--good); box-shadow: 0 0 8px var(--good); }
+  h1 { font-size: clamp(36px, 5.5vw, 56px); line-height: 1.05; margin: 0 0 18px;
+       font-weight: 700; letter-spacing: -1.5px;
+       background: var(--grad-text); -webkit-background-clip: text;
+       background-clip: text; color: transparent; }
+  h1 .acc { background: var(--grad-accent); -webkit-background-clip: text;
+            background-clip: text; color: transparent; }
+  .hero p { font-size: 17px; color: var(--ink-1); margin: 0 auto;
+            max-width: 540px; line-height: 1.55; }
+  /* ============ Stepper ============ */
+  .stepper { display: flex; gap: 14px; margin-bottom: 36px; max-width: 720px;
+             margin-left: auto; margin-right: auto; }
+  .stepper .s { flex: 1; padding: 14px 16px; background: var(--panel);
+                backdrop-filter: blur(12px); border: 1px solid var(--line);
+                border-radius: 14px; display: flex; gap: 12px; align-items: center;
+                transition: all 0.25s cubic-bezier(.4,0,.2,1); position: relative;
+                overflow: hidden; }
+  .stepper .s::before {
+    content: ''; position: absolute; inset: 0; border-radius: 14px;
+    background: var(--grad-accent); opacity: 0; transition: opacity 0.25s;
+    z-index: -1; }
+  .stepper .s.active { border-color: var(--line-hot);
+                       box-shadow: 0 8px 32px -8px rgba(106,166,255,0.25); }
+  .stepper .s.done { border-color: rgba(52,211,153,0.35); }
+  .stepper .num { width: 30px; height: 30px; border-radius: 9px;
+                  background: var(--line); display: grid; place-items: center;
+                  font-weight: 700; font-size: 13px; color: var(--ink-3);
+                  transition: all 0.25s; }
+  .stepper .active .num { background: var(--grad-accent); color: #0a0e1a;
+                           box-shadow: 0 0 16px rgba(106,166,255,0.4); }
+  .stepper .done .num { background: var(--good); color: #052016; }
+  .stepper .done .num::after { content: '✓'; }
+  .stepper .done .num span { display: none; }
+  .stepper .lbl { font-size: 13px; color: var(--ink-3); font-weight: 500;
+                  transition: color 0.25s; }
+  .stepper .active .lbl, .stepper .done .lbl { color: var(--ink-0); }
+  /* ============ Honesty notice ============ */
+  .notice { background: rgba(251,191,36,0.06); border: 1px solid rgba(251,191,36,0.18);
+            padding: 14px 18px; border-radius: 12px; font-size: 13px;
+            color: #d4c08a; margin: 0 auto 32px; max-width: 720px; line-height: 1.6;
+            backdrop-filter: blur(8px); }
+  .notice strong { color: var(--warn); font-weight: 600; }
+  /* ============ Step pages ============ */
+  .step { display: none; max-width: 880px; margin: 0 auto;
+          animation: rise 0.45s cubic-bezier(.4,0,.2,1); }
+  .step.active { display: block; }
+  @keyframes rise { from { opacity: 0; transform: translateY(12px); }
+                    to { opacity: 1; transform: translateY(0); } }
+  h2 { font-size: 24px; margin: 0 0 8px; font-weight: 600; letter-spacing: -0.4px;
+       text-align: center; }
+  .step-sub { color: var(--ink-1); margin: 0 0 32px; text-align: center;
+              font-size: 14px; }
+  /* ============ Cards ============ */
+  .grid { display: grid; gap: 14px;
+          grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .card { background: var(--panel); backdrop-filter: blur(12px);
+          border: 1px solid var(--line); border-radius: 16px;
+          padding: 22px 20px; cursor: pointer; position: relative;
+          transition: all 0.25s cubic-bezier(.4,0,.2,1);
+          overflow: hidden; }
+  .card::before {
+    content: ''; position: absolute; inset: 0; border-radius: 16px; padding: 1px;
+    background: var(--grad-accent);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor; mask-composite: exclude;
+    opacity: 0; transition: opacity 0.25s; pointer-events: none; }
+  .card:hover { transform: translateY(-3px); border-color: transparent;
+                box-shadow: 0 20px 40px -16px rgba(0,0,0,0.4); }
+  .card:hover::before { opacity: 1; }
+  .card.sel { transform: translateY(-3px); border-color: transparent;
+              box-shadow: var(--shadow-glow), 0 20px 40px -16px rgba(0,0,0,0.4);
+              background: linear-gradient(180deg, rgba(106,166,255,0.08), rgba(167,139,250,0.04)); }
+  .card.sel::before { opacity: 1; }
+  .card .icon { font-size: 28px; margin-bottom: 12px; display: inline-block;
+                line-height: 1; }
+  .card .name { font-weight: 600; font-size: 16px; margin-bottom: 6px;
+                letter-spacing: -0.2px; }
+  .card .desc { color: var(--ink-1); font-size: 13px; line-height: 1.55; }
+  /* ============ Form ============ */
+  .form-card { background: var(--panel); backdrop-filter: blur(12px);
+               border: 1px solid var(--line); border-radius: 18px;
+               padding: 28px; box-shadow: var(--shadow-card); }
+  label { display: block; margin: 18px 0 7px; color: var(--ink-1);
+          font-size: 13px; font-weight: 500; letter-spacing: -0.1px; }
+  label:first-child { margin-top: 0; }
+  textarea, input[type=text], input[type=number], input[type=file] {
+    width: 100%; padding: 11px 14px; background: rgba(7,10,18,0.5);
+    color: var(--ink-0); border: 1px solid var(--line); border-radius: 10px;
+    font: 14px/1.5 inherit; font-family: inherit;
+    transition: border-color 0.15s, background 0.15s; }
+  textarea:focus, input:focus { outline: none; border-color: var(--accent-1);
+                                 background: rgba(7,10,18,0.7); }
+  textarea { min-height: 96px; resize: vertical; }
+  input[type=file] { padding: 9px; cursor: pointer; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 140px; }
+  .ck { display: flex; gap: 10px; align-items: center; margin: 18px 0; }
+  .ck input { width: auto; accent-color: var(--accent-1); }
+  .ck label { margin: 0; cursor: pointer; }
+  details { margin-top: 22px; }
+  summary { cursor: pointer; color: var(--ink-1); padding: 10px 14px;
+            font-size: 13px; user-select: none; font-weight: 500;
+            border: 1px solid var(--line); border-radius: 10px;
+            transition: all 0.15s; list-style: none; display: flex;
+            align-items: center; gap: 8px; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: '⚙'; font-size: 13px; opacity: 0.7; }
+  summary:hover { color: var(--ink-0); border-color: var(--accent-1); }
+  /* ============ Nav buttons ============ */
+  .nav { display: flex; justify-content: space-between; margin-top: 32px;
+         gap: 12px; }
+  button { padding: 12px 26px; background: var(--grad-accent); color: #0a0e1a;
+           border: 0; border-radius: 10px; font: 600 14px inherit; cursor: pointer;
+           font-family: inherit; letter-spacing: -0.1px;
+           transition: all 0.2s cubic-bezier(.4,0,.2,1);
+           box-shadow: 0 8px 24px -8px rgba(106,166,255,0.4); }
+  button:hover { transform: translateY(-1px);
+                 box-shadow: 0 12px 28px -8px rgba(106,166,255,0.55); }
+  button:active { transform: translateY(0); }
+  button.ghost { background: transparent; color: var(--ink-1);
+                 border: 1px solid var(--line); box-shadow: none; }
+  button.ghost:hover { color: var(--ink-0); border-color: var(--accent-1);
+                       background: rgba(106,166,255,0.04);
+                       transform: translateY(-1px); box-shadow: none; }
+  button:disabled { opacity: 0.35; cursor: not-allowed;
+                    transform: none; box-shadow: none; }
+  button:disabled:hover { transform: none; }
+  /* Submit button glow pulse + spinner state */
+  button.glow { position: relative; padding: 12px 30px; overflow: hidden;
+                animation: btn-pulse 3.5s ease-in-out infinite; }
+  @keyframes btn-pulse {
+    0%, 100% { box-shadow: 0 8px 24px -8px rgba(122,92,255,0.4); }
+    50%      { box-shadow: 0 12px 32px -8px rgba(122,92,255,0.7),
+                            0 0 0 4px rgba(122,92,255,0.12); }
+  }
+  button .btn-spin { display: none; align-items: center; gap: 10px; }
+  button.loading .btn-label { display: none; }
+  button.loading .btn-spin { display: inline-flex; }
+  button.loading { animation: none; }
+  button.loading .ring::before { border-top-color: #0a0e1a; }
+  button.loading .ring::after  { border-top-color: rgba(10,14,26,0.6); }
+  /* ============ Summary chips on step 3 ============ */
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 24px;
+           justify-content: center; }
+  .chip { background: rgba(22,27,42,0.6); padding: 7px 14px; border-radius: 999px;
+          font-size: 12px; color: var(--ink-1); border: 1px solid var(--line);
+          backdrop-filter: blur(8px); letter-spacing: 0.1px; }
+  .chip strong { color: var(--ink-0); font-weight: 600; }
+  /* ============ Gallery (footer) ============ */
+  .gallery { margin-top: 80px; padding-top: 48px;
+             border-top: 1px solid var(--line); }
+  .gallery h3 { font-size: 14px; color: var(--ink-1); text-transform: uppercase;
+                letter-spacing: 1.5px; font-weight: 600; margin: 0 0 24px;
+                text-align: center; }
+  .gallery-grid { display: grid; gap: 12px;
+                  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+  .gallery-grid .slot { aspect-ratio: 9/14; background: var(--panel);
+                        border-radius: 12px; border: 1px solid var(--line);
+                        display: grid; place-items: center;
+                        color: var(--ink-3); font-size: 12px;
+                        font-family: 'Geist Mono', monospace; }
+  footer { margin-top: 56px; text-align: center; color: var(--ink-3);
+           font-size: 12px; line-height: 1.6; }
+  footer a { color: var(--ink-1); text-decoration: none; }
+  footer a:hover { color: var(--ink-0); }
+  /* ============ Mobile ============ */
+  @media (max-width: 720px) {
+    .wrap { padding: 28px 18px 60px; }
+    .top { margin-bottom: 36px; }
+    .hero { margin-bottom: 36px; }
+    h1 { font-size: 36px; letter-spacing: -1px; }
+    .hero p { font-size: 15px; }
+    .stepper { flex-direction: column; gap: 8px; }
+    .stepper .s { padding: 12px; }
+    .form-card { padding: 20px; }
+    .nav { flex-direction: column-reverse; }
+    .nav button { width: 100%; }
+  }
 </style>
 </head><body>
-<h1>image2video</h1>
-<div class="tabs">
-  <div class="tab active" data-tab="t2v">Text → Video</div>
-  <div class="tab" data-tab="i2v">Image → Video</div>
-  <div class="tab" data-tab="extend">Extend Existing</div>
-</div>
+<div class="aurora"><div class="blob"></div></div>
+<div class="grain"></div>
+<div class="wrap">
+  <div class="top">
+    <div class="logo">
+      <span class="mark"></span>
+      <span>image2video</span>
+    </div>
+    <div class="nav-r">
+      <a href="#recent">Recent jobs</a>
+      <a href="https://github.com/dlmastery" target="_blank">GitHub</a>
+    </div>
+  </div>
 
-<form id="f-t2v" class="panel active" method="post" action="/generate/t2v">
-  <label>Prompt</label>
-  <textarea name="prompt" placeholder="A cinematic shot of a fox running through a foggy autumn forest at dawn, golden light, slow tracking camera"></textarea>
-  <label>Negative prompt (optional)</label>
-  <textarea name="negative" placeholder="blurry, low quality, watermark, distorted"></textarea>
-  <div class="row">
-    <div><label>Width</label><input name="width" type="number" value="768"></div>
-    <div><label>Height</label><input name="height" type="number" value="512"></div>
-    <div><label>Frames</label><input name="frames" type="number" value="97"></div>
-    <div><label>Steps</label><input name="steps" type="number" value="30"></div>
-    <div><label>Seed (0 = random)</label><input name="seed" type="number" value="0"></div>
+  <div class="hero">
+    <div class="pill"><span class="dot"></span> Local · GPU ready · LTX-2.3 · 10Eros</div>
+    <h1>Bring stills to <span class="acc">life.</span></h1>
+    <p>Drop in a portrait, pick a style, describe the motion. Cinematic short clips
+       with synced audio — generated on your own GPU in minutes.</p>
   </div>
-  <div class="checkbox">
-    <input type="checkbox" id="enh-t2v" name="enhance" value="1" checked>
-    <label for="enh-t2v" style="margin:0">Enhance prompt with Qwen first</label>
-  </div>
-  <button type="submit">Generate</button>
-</form>
 
-<form id="f-i2v" class="panel" method="post" action="/generate/i2v" enctype="multipart/form-data">
-  <label>Source image (first frame)</label>
-  <input type="file" name="source" accept="image/*" required>
-  <label>Prompt (describes motion)</label>
-  <textarea name="prompt" placeholder="The character begins walking forward, camera slowly pans right, atmospheric"></textarea>
-  <label>Negative prompt (optional)</label>
-  <textarea name="negative"></textarea>
-  <div class="row">
-    <div><label>Width</label><input name="width" type="number" value="768"></div>
-    <div><label>Height</label><input name="height" type="number" value="512"></div>
-    <div><label>Frames</label><input name="frames" type="number" value="97"></div>
-    <div><label>Steps</label><input name="steps" type="number" value="30"></div>
+  <div class="notice">
+    <strong>Heads up</strong> — LTX-2.3 preserves the <em>vibe</em> of your source
+    (skin tone, hair color, jewelry, clothing, mood) and gives you beautiful
+    motion, but it doesn't pixel-clone your exact face. Expect "this style of
+    person doing what you described," not a strict photographic copy.
   </div>
-  <div class="checkbox">
-    <input type="checkbox" id="enh-i2v" name="enhance" value="1" checked>
-    <label for="enh-i2v" style="margin:0">Enhance prompt with Qwen first</label>
-  </div>
-  <button type="submit">Generate</button>
-</form>
 
-<div id="f-extend" class="panel">
-  <p>To extend a video, generate one in the T2V or I2V tab first, then use
-  the <strong>Extend</strong> button on its viewer page.</p>
-  <p>Recent jobs:</p>
-  <ul id="recent"></ul>
+  <div class="stepper">
+    <div class="s active" data-step="1"><div class="num"><span>1</span></div><div class="lbl">Pick mode</div></div>
+    <div class="s" data-step="2"><div class="num"><span>2</span></div><div class="lbl">Pick style</div></div>
+    <div class="s" data-step="3"><div class="num"><span>3</span></div><div class="lbl">Describe &amp; go</div></div>
+  </div>
+
+  <!-- ============ Step 1: pick mode ============ -->
+  <div class="step active" data-step="1">
+    <h2>What are you making?</h2>
+    <p class="step-sub">Three modes. Pick the one that fits your input.</p>
+    <div class="grid">
+      <div class="card" data-mode="i2v">
+        <div class="icon">🎞️</div>
+        <div class="name">Image → Video</div>
+        <div class="desc">Animate a still photo. Best for portraits and scenes you already have.</div>
+      </div>
+      <div class="card" data-mode="t2v">
+        <div class="icon">✨</div>
+        <div class="name">Text → Video</div>
+        <div class="desc">Generate from a prompt alone. Best for scenes with no reference image.</div>
+      </div>
+      <div class="card" data-mode="extend">
+        <div class="icon">↪️</div>
+        <div class="name">Extend a video</div>
+        <div class="desc">Continue from a previously generated clip's last frame.</div>
+      </div>
+    </div>
+    <div class="nav">
+      <span></span>
+      <button id="b1-next" disabled>Continue →</button>
+    </div>
+  </div>
+
+  <!-- ============ Step 2: pick preset ============ -->
+  <div class="step" data-step="2">
+    <h2>Pick a style</h2>
+    <p class="step-sub">Each preset sets prompts, dimensions, frames and sampling for you.</p>
+    <div class="grid" id="preset-grid"></div>
+    <div class="nav">
+      <button class="ghost" data-back="1">← Back</button>
+      <button id="b2-next" disabled>Continue →</button>
+    </div>
+  </div>
+
+  <!-- ============ Step 3: prompt + image + go ============ -->
+  <div class="step" data-step="3">
+    <h2>Describe the scene</h2>
+    <p class="step-sub">We pre-filled the prompt. Tweak it to taste — then go.</p>
+    <div class="chips" id="summary-chips"></div>
+    <div class="form-card">
+      <form id="genForm" method="post" enctype="multipart/form-data">
+        <div id="image-field-wrap">
+          <label>Source image (the first frame of your video)</label>
+          <input type="file" name="source" id="source-input" accept="image/*">
+        </div>
+        <label>Prompt — describe what you want to happen</label>
+        <textarea name="prompt" id="prompt-input" placeholder=""></textarea>
+        <details>
+          <summary>Advanced settings</summary>
+          <label>Negative prompt</label>
+          <textarea name="negative" id="negative-input"></textarea>
+          <div class="row">
+            <div><label>Width</label><input name="width" id="width-input" type="number" value="768"></div>
+            <div><label>Height</label><input name="height" id="height-input" type="number" value="1024"></div>
+            <div><label>Frames</label><input name="frames" id="frames-input" type="number" value="49"></div>
+            <div><label>Steps</label><input name="steps" id="steps-input" type="number" value="13"></div>
+            <div><label>Seed (0 = random)</label><input name="seed" type="number" value="0"></div>
+          </div>
+          <div class="ck">
+            <input type="checkbox" id="enh" name="enhance" value="1" checked>
+            <label for="enh">Let Qwen polish my prompt first</label>
+          </div>
+        </details>
+        <div class="nav">
+          <button type="button" class="ghost" data-back="2">← Back</button>
+          <button type="submit" id="gen-btn" class="glow">
+            <span class="btn-label">Generate clip →</span>
+            <span class="btn-spin"><span class="ring"></span> Submitting…</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ Gallery / footer ============ -->
+  <div class="gallery">
+    <h3>Recent generations</h3>
+    <div class="gallery-grid" id="recent-grid">
+      <div class="slot">empty</div>
+      <div class="slot">empty</div>
+      <div class="slot">empty</div>
+      <div class="slot">empty</div>
+      <div class="slot">empty</div>
+      <div class="slot">empty</div>
+    </div>
+  </div>
+
+  <footer>
+    <p>Powered by LTX-2.3 · 10Eros UNET · Vantage workflow · TenStrip's 10S nodes<br>
+       Running locally on your RTX 4090. No data leaves your machine.</p>
+  </footer>
 </div>
 
 <script>
-  document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
-    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
-    document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
-    t.classList.add('active');
-    document.getElementById('f-' + t.dataset.tab).classList.add('active');
+  // ============ Preset definitions ============
+  // Each preset bundles prompt template, negative prompt, dims, frames, steps.
+  // Pulls from the lessons we learned: 17-frame minimum for I2V due to audio
+  // sync chain, photoreal CFG works better when frames are ≥49.
+  const PRESETS = {
+    i2v: [
+      { id: 'cinematic_portrait', icon: '🎞️', name: 'Cinematic Portrait',
+        desc: 'Close-up, gentle motion, photorealistic. Best for portraits.',
+        prompt: 'cinematic close-up portrait, soft gentle expression forming, subtle breathing motion, photorealistic, sharp focus, natural skin texture, studio lighting',
+        negative: 'anime, cartoon, drawing, illustration, painting, 3d render, cgi, stylized, blurry, distorted, deformed',
+        width: 768, height: 1024, frames: 49, steps: 13 },
+      { id: 'talking_head', icon: '🗣️', name: 'Talking Head',
+        desc: 'Subject speaks; lips move. Good for vlogs, voiceovers.',
+        prompt: 'medium close-up of the subject speaking naturally, lips moving, subtle head motion, natural eye contact, professional video',
+        negative: 'anime, cartoon, blurry, distorted, frozen pose, motionless',
+        width: 768, height: 1024, frames: 97, steps: 20 },
+      { id: 'landscape_pan', icon: '🏞️', name: 'Landscape Pan',
+        desc: 'Slow camera pan across the scene. Best for sceneries.',
+        prompt: 'slow cinematic camera pan from left to right across the landscape, gentle wind in foliage, atmospheric, golden hour lighting',
+        negative: 'anime, cartoon, distorted perspective, static frame',
+        width: 1280, height: 768, frames: 97, steps: 20 },
+      { id: 'anime_motion', icon: '🌸', name: 'Anime Motion',
+        desc: 'Stylized motion (enables OmniNFT). Use only if you want anime.',
+        prompt: 'anime style motion, smooth animation, expressive character, vibrant colors',
+        negative: 'blurry, distorted, deformed, photorealistic',
+        width: 768, height: 1024, frames: 49, steps: 13 },
+      { id: 'custom', icon: '⚙️', name: 'Custom',
+        desc: 'Empty prompts, you fill everything in.',
+        prompt: '', negative: '',
+        width: 768, height: 1024, frames: 49, steps: 13 },
+    ],
+    t2v: [
+      { id: 'cinematic_scene', icon: '🎞️', name: 'Cinematic Scene',
+        desc: 'Photorealistic scene from a prompt alone.',
+        prompt: 'cinematic shot of [your scene], photorealistic, 8k, sharp focus, atmospheric lighting',
+        negative: 'anime, cartoon, blurry, low quality',
+        width: 1280, height: 768, frames: 97, steps: 20 },
+      { id: 'nature_doc', icon: '🌿', name: 'Nature Doc',
+        desc: 'Slow, observational, BBC Earth style.',
+        prompt: 'slow cinematic nature documentary shot, [your subject], observational camera, natural lighting, photorealistic',
+        negative: 'anime, cartoon, fast motion, distorted',
+        width: 1280, height: 768, frames: 97, steps: 20 },
+      { id: 'custom', icon: '⚙️', name: 'Custom',
+        desc: 'Empty prompts.',
+        prompt: '', negative: '',
+        width: 1280, height: 768, frames: 97, steps: 20 },
+    ],
+    // Extend mode is special: presets come from /jobs.json (your prior
+    // completed renders). Populated dynamically when step 2 opens.
+    extend: [],
+  };
+
+  // ============ State ============
+  let mode = null, preset = null, extendParentId = null;
+
+  // ============ Step navigation ============
+  function showStep(n) {
+    document.querySelectorAll('.step').forEach(s =>
+      s.classList.toggle('active', +s.dataset.step === n));
+    document.querySelectorAll('.stepper .s').forEach(s => {
+      const sn = +s.dataset.step;
+      s.classList.toggle('active', sn === n);
+      s.classList.toggle('done', sn < n);
+    });
+  }
+  document.querySelectorAll('[data-back]').forEach(b =>
+    b.onclick = () => showStep(+b.dataset.back));
+
+  // ============ Step 1: mode select ============
+  document.querySelectorAll('[data-mode]').forEach(c => c.onclick = () => {
+    document.querySelectorAll('[data-mode]').forEach(x => x.classList.remove('sel'));
+    c.classList.add('sel');
+    mode = c.dataset.mode;
+    document.getElementById('b1-next').disabled = false;
   });
-  // Lazy: surface recent jobs on the Extend tab if we have them in memory.
-  // For MVP we just hint the user to navigate from a viewer page.
+  document.getElementById('b1-next').onclick = () => {
+    renderPresets(); showStep(2);
+  };
+
+  // ============ Step 2: preset select (or recent-job select if Extend) ============
+  function renderPresets() {
+    const grid = document.getElementById('preset-grid');
+    grid.innerHTML = '<div class="card" style="grid-column:1/-1;justify-self:center;border:none;background:none;cursor:default;"><span class="ring"></span></div>';
+    preset = null; extendParentId = null;
+    document.getElementById('b2-next').disabled = true;
+    if (mode === 'extend') {
+      // Fetch recent completed jobs; user picks which to extend.
+      fetch('/jobs.json').then(r => r.json()).then(items => {
+        grid.innerHTML = '';
+        if (!items || !items.length) {
+          grid.innerHTML = '<div class="card" style="grid-column:1/-1;cursor:default;">' +
+            '<div class="icon">📭</div><div class="name">No completed jobs yet</div>' +
+            '<div class="desc">Generate a video first (T2V or I2V) — it will appear here for extending.</div></div>';
+          return;
+        }
+        items.forEach(it => {
+          const div = document.createElement('div');
+          div.className = 'card'; div.dataset.preset = it.id;
+          div.style.cssText = 'padding:0;overflow:hidden;';
+          div.innerHTML = `
+            <video src="${it.thumb}" muted playsinline preload="metadata"
+                   style="width:100%;aspect-ratio:9/14;object-fit:cover;display:block;"
+                   onmouseover="this.play()" onmouseout="this.pause();this.currentTime=0"></video>
+            <div style="padding:14px 16px;">
+              <div class="name">${it.mode.toUpperCase()} · ${it.id.slice(0,8)}</div>
+              <div class="desc">${it.prompt}…</div>
+            </div>`;
+          div.onclick = () => {
+            document.querySelectorAll('[data-preset]').forEach(x => x.classList.remove('sel'));
+            div.classList.add('sel');
+            extendParentId = it.id;
+            preset = { id: 'extend_'+it.id, prompt: '', negative: '',
+                       width: 768, height: 1024, frames: 49, steps: 13,
+                       name: 'Extend ' + it.id.slice(0,8) };
+            document.getElementById('b2-next').disabled = false;
+          };
+          grid.appendChild(div);
+        });
+      }).catch(() => {
+        grid.innerHTML = '<div class="card" style="cursor:default;grid-column:1/-1;">' +
+          'Could not load recent jobs.</div>';
+      });
+      return;
+    }
+    // Regular style preset picker
+    grid.innerHTML = '';
+    (PRESETS[mode] || []).forEach(p => {
+      const div = document.createElement('div');
+      div.className = 'card'; div.dataset.preset = p.id;
+      div.innerHTML = `<div class="icon">${p.icon}</div>
+                       <div class="name">${p.name}</div>
+                       <div class="desc">${p.desc}</div>`;
+      div.onclick = () => {
+        document.querySelectorAll('[data-preset]').forEach(x => x.classList.remove('sel'));
+        div.classList.add('sel');
+        preset = p;
+        document.getElementById('b2-next').disabled = false;
+      };
+      grid.appendChild(div);
+    });
+  }
+  document.getElementById('b2-next').onclick = () => {
+    applyPreset(); showStep(3);
+  };
+
+  // ============ Step 3: apply preset to form, configure submission ============
+  function applyPreset() {
+    // Summary chips
+    const sc = document.getElementById('summary-chips');
+    sc.innerHTML =
+      `<span class="chip">Mode: <strong>${mode.toUpperCase()}</strong></span>
+       <span class="chip">Preset: <strong>${preset.name}</strong></span>
+       <span class="chip">Dims: <strong>${preset.width}×${preset.height}</strong></span>
+       <span class="chip">Frames: <strong>${preset.frames}</strong></span>`;
+
+    // Hide/show source image based on mode (Extend uses parent's last frame).
+    const wrap = document.getElementById('image-field-wrap');
+    const src = document.getElementById('source-input');
+    if (mode === 'i2v') { wrap.style.display = 'block'; src.required = true; }
+    else                { wrap.style.display = 'none';  src.required = false; }
+
+    // Fill form fields
+    document.getElementById('prompt-input').value = preset.prompt;
+    document.getElementById('prompt-input').placeholder =
+      mode === 'extend'
+        ? "Describe what happens next (the previous clip's last frame is the seed)…"
+        : (preset.prompt ? '' : 'Describe what should happen in the video…');
+    document.getElementById('negative-input').value = preset.negative;
+    document.getElementById('width-input').value = preset.width;
+    document.getElementById('height-input').value = preset.height;
+    document.getElementById('frames-input').value = preset.frames;
+    document.getElementById('steps-input').value = preset.steps;
+
+    // Submission action routes to backend by mode
+    const f = document.getElementById('genForm');
+    f.action = mode === 'extend'
+      ? '/extend/' + extendParentId
+      : '/generate/' + mode;
+  }
+  // Spinner on submit
+  document.getElementById('genForm').addEventListener('submit', () => {
+    const btn = document.getElementById('gen-btn');
+    if (btn) { btn.classList.add('loading'); btn.disabled = true; }
+  });
+
+  // ============ Recent jobs gallery ============
+  fetch('/jobs.json').then(r => r.json()).then(items => {
+    const grid = document.getElementById('recent-grid');
+    if (!items || !items.length) {
+      grid.innerHTML = '<div class="slot" style="grid-column:1/-1;">' +
+        'No generations yet — make one above ↑</div>';
+      return;
+    }
+    grid.innerHTML = '';
+    items.forEach(it => {
+      const a = document.createElement('a');
+      a.href = it.url; a.className = 'slot';
+      a.style.cssText = 'overflow:hidden;position:relative;text-decoration:none;padding:0;';
+      a.innerHTML = `
+        <video src="${it.thumb}" muted playsinline preload="metadata"
+               style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;"
+               onmouseover="this.play()" onmouseout="this.pause();this.currentTime=0"></video>
+        <div style="position:absolute;inset:auto 0 0 0;padding:8px 10px;
+                    background:linear-gradient(180deg,transparent,rgba(7,10,18,0.85));
+                    font-size:11px;color:#cdd5e6;letter-spacing:0.2px;">
+          <strong style="text-transform:uppercase;font-size:10px;letter-spacing:1px;
+                         color:#82b6ff;">${it.mode}</strong><br>${it.prompt}…
+        </div>`;
+      grid.appendChild(a);
+    });
+  }).catch(() => { /* gallery is optional */ });
 </script>
 </body></html>
 """
