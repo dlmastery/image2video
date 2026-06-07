@@ -40,6 +40,14 @@ ComfyUI is doing right now (toggleable to save bandwidth), and a
 scrolling gallery of generated artifacts (intermediate frames + probes)
 as they appear.
 
+### 5 · Done — play, download, or extend
+![Step 5 — done](docs/screenshots/05_done.png)
+
+Inline `<video>` player with the result, download button for the muxed
+MP4, and an Extend panel that takes the last frame as the seed for a
+continuation clip. End-to-end run verified via Playwright in ~6.5 min
+on a single RTX 4090 Laptop.
+
 ## What you get
 
 | Mode | Input | Output |
